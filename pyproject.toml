@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rsi-multi-harness-rl"
+version = "0.1.0"
+description = "Cross-harness generalization for agentic RL: train a policy across several agent harnesses, then measure how much of it transfers to a harness it has never seen"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+keywords = [
+    "agentic-rl",
+    "grpo",
+    "rlvr",
+    "agent-harness",
+    "generalization",
+    "reinforcement-learning",
+    "llm-post-training",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# The core is deliberately dependency-free: harnesses, tasks, the verifier, and
+# the static guards import nothing outside the standard library. That is what
+# lets CI run real tests (including the harness-layer smoke) without installing
+# torch, and it is enforced by the `core` job in .github/workflows/ci.yml.
+dependencies = []
+
+[project.optional-dependencies]
+# The RL stack. `trl` is pinned to the dev line because the multi-environment
+# routing used here (environment_factory as a dict, per-example tool schema,
+# env-owned get_reward) is not in the released 0.x line. Installing this extra
+# requires a build of trl from source; see README, "Reproducing".
+rl = [
+    "torch>=2.6",
+    "transformers>=4.56",
+    "datasets>=3.2",
+    "accelerate>=1.2",
+    "peft>=0.14",
+    "trl>=1.10.0.dev0",
+]
+
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/multiharness"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# The entry-point scripts insert src/ on sys.path before importing the package
+# (see src/multiharness/_bootstrap.py for why that cannot be factored out), so
+# their imports are unavoidably not at the top of the file.
+"scripts/*.py" = ["E402"]
+"tests/*.py" = ["E402"]

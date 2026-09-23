@@ -1,0 +1,28 @@
+# Normalize line endings for every text file in the repository.
+# Without this, a Windows checkout rewrites LF to CRLF and every later diff is
+# noise -- which matters here because the shell scripts are the experiment's
+# entry points and a CRLF shebang line is not executable.
+* text=auto eol=lf
+
+# Shell scripts must keep LF, and are marked as shell so GitHub renders them.
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Binary assets are never touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.gz binary
+*.safetensors binary
+*.pt binary
+*.bin binary
+
+# Generated or vendored content is excluded from language statistics.
+*.lock linguist-generated=true
+outputs/** linguist-generated=true
