@@ -115,7 +115,7 @@ def main() -> int:
     print(f"rollouts: {len(records)}   tool_errors: {total_err}")
     print(f"by harness: {dict(by_harness)}")
 
-    print(f"\n-- class 1: HARNESS BUG (tool advertised but not implemented) --")
+    print("\n-- class 1: HARNESS BUG (tool advertised but not implemented) --")
     if harness_bug:
         for (h, tool), n in harness_bug.most_common():
             print(f"   {h:<18} {tool:<18} x{n}")
@@ -123,7 +123,7 @@ def main() -> int:
     else:
         print("   (none) — no harness advertises a tool it does not implement")
 
-    print(f"\n-- class 2: hallucinated tool (not advertised) = genuine signal --")
+    print("\n-- class 2: hallucinated tool (not advertised) = genuine signal --")
     if hallucinated:
         for (h, tool), n in hallucinated.most_common():
             print(f"   {h:<18} {tool:<18} x{n}"
@@ -133,14 +133,14 @@ def main() -> int:
     else:
         print("   (none)")
 
-    print(f"\n-- class 3: bad arguments = genuine signal --")
+    print("\n-- class 3: bad arguments = genuine signal --")
     if badargs:
         for (h, tool), n in badargs.most_common():
             print(f"   {h:<18} {tool:<18} x{n}")
     else:
         print("   (none)")
 
-    print(f"\n-- class 3b: raw OS error leaked to the model = HARNESS DEFECT --")
+    print("\n-- class 3b: raw OS error leaked to the model = HARNESS DEFECT --")
     if os_leak:
         for (h, tool), n in os_leak.most_common():
             print(f"   {h:<18} {tool:<18} x{n}")
@@ -150,7 +150,7 @@ def main() -> int:
     else:
         print("   (none)")
 
-    print(f"\n-- class 4: other errors --")
+    print("\n-- class 4: other errors --")
     if other:
         for (h, tail), n in other.most_common(12):
             print(f"   {h:<18} x{n}  ...{tail}")
@@ -159,7 +159,7 @@ def main() -> int:
 
     # A tool that is registered but never advertised is a third defect: the
     # model cannot use what it was never told about.
-    print(f"\n-- class 5: implemented but unadvertised --")
+    print("\n-- class 5: implemented but unadvertised --")
     unadvertised = []
     for h in advertised:
         extra = registered[h] - advertised[h] - {"bash"}

@@ -26,17 +26,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 import torch  # noqa: E402
-from datasets import Dataset  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
-from trl import GRPOConfig, GRPOTrainer  # noqa: E402
-
-from multiharness._bootstrap import outputs_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Canary: refuse to spend a GPU run on a shadowed `trl`.
@@ -54,6 +48,11 @@ from multiharness._bootstrap import outputs_root  # noqa: E402
 # `__version__` — hence the test below.
 # ---------------------------------------------------------------------------
 import trl  # noqa: E402
+from datasets import Dataset  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
+from trl import GRPOConfig, GRPOTrainer  # noqa: E402
+
+from multiharness._bootstrap import outputs_root  # noqa: E402
 
 if not hasattr(trl, "__version__"):
     print(f"!! `trl` resolved to a shadowing directory: {trl.__path__}")

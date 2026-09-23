@@ -134,7 +134,7 @@ def main() -> int:
               (workdir / f"ok_{hname}.txt").read_text(encoding="utf-8") == "hello")
 
     # A nested path must still auto-create parents.
-    for hname, cls in ALL_HARNESSES.items():
+    for cls in ALL_HARNESSES.values():
         env = cls()
         env._workdir = workdir
         if "write_file" not in {m.__name__ for m in _tools(env)}:

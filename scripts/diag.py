@@ -16,7 +16,6 @@ import argparse
 import sys
 from pathlib import Path
 
-
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -97,9 +96,11 @@ def main() -> int:
 
     print("\n" + "=" * 78)
     for i in range(args.n):
-        print(f"row {i}: reward={envs[i].get_reward()}  answer_file="
-              f"{(envs[i]._workdir / 'answer.txt').read_text(encoding='utf-8', errors='replace')[:120]!r}"
-              if (envs[i]._workdir / "answer.txt").is_file() else f"row {i}: reward={envs[i].get_reward()} no answer.txt")
+        reward = envs[i].get_reward()
+        answer = envs[i]._workdir / "answer.txt"
+        shown = (answer.read_text(encoding="utf-8", errors="replace")[:120]
+                 if answer.is_file() else "no answer.txt")
+        print(f"row {i}: reward={reward}  answer_file={shown!r}")
     return 0
 
 

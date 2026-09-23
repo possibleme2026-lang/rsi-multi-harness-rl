@@ -30,7 +30,6 @@ import json
 import sys
 from pathlib import Path
 
-
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -41,7 +40,6 @@ from trl import GRPOConfig, GRPOTrainer
 
 from multiharness._bootstrap import outputs_root
 from multiharness.harnesses import (
-    ALL_HARNESSES,
     HELDOUT_HARNESSES,
     TRAIN_HARNESSES,
 )
@@ -141,12 +139,13 @@ def main() -> int:
 
     load_tasks()
 
-    if args.mode == "single":
-        # bash_minimal is the plainest scaffold, so the baseline is not
-        # handicapped by a harness the model would struggle with anyway.
-        harnesses = {"bash_minimal": TRAIN_HARNESSES["bash_minimal"]}
-    else:
-        harnesses = dict(TRAIN_HARNESSES)
+    # bash_minimal is the plainest scaffold, so the single-harness baseline is
+    # not handicapped by a harness the model would struggle with anyway.
+    harnesses = (
+        {"bash_minimal": TRAIN_HARNESSES["bash_minimal"]}
+        if args.mode == "single"
+        else dict(TRAIN_HARNESSES)
+    )
 
     assert not (set(harnesses) & set(HELDOUT_HARNESSES)), "held-out harness leaked into training"
 

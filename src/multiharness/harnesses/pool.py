@@ -22,8 +22,6 @@ adapting. That is the cross-harness signal this experiment measures.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from .core import ANSWER_NAME, BaseHarnessEnv, _run_shell, resolve_workspace_path
 
 # --------------------------------------------------------------------------
@@ -202,7 +200,7 @@ class LongCtxEnv(BaseHarnessEnv):
         if not p.is_file():
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(new, encoding="utf-8")
-            return f"file did not exist; created it with the replacement text"
+            return "file did not exist; created it with the replacement text"
         text = p.read_text(encoding="utf-8", errors="replace")
         if old == "":
             p.write_text(new, encoding="utf-8")

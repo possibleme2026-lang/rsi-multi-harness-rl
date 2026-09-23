@@ -24,6 +24,7 @@ it is graded.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import os
@@ -196,10 +197,12 @@ def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_tree(proc.pid)
-            try:
+            # The tree kill was already issued; if the direct child still has
+            # not reaped after 10s, move on rather than blocking here. The
+            # original bug was precisely a cleanup path that could block
+            # forever, so this second wait must never be unbounded.
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass  # tree kill already issued; do not block on it
 
         sink.seek(0)
         raw = sink.read()

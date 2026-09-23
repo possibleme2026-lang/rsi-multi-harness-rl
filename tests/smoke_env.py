@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import inspect
 import sys
-import tempfile
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -145,7 +144,7 @@ def main() -> int:
     from multiharness.harnesses import OracleHarness
 
     bad = []
-    for tid, task in sorted(TASKS.items()):
+    for tid in sorted(TASKS):
         o = OracleHarness()
         o.reset(task_id=tid)
         if o.get_reward() != 1.0:
@@ -162,7 +161,6 @@ def main() -> int:
 
     # -- 5. T3 escaping actually reaches the file intact ------------------
     print("\n-- 5. T3 payloads survive a correct bash write --")
-    import shlex
 
     from multiharness.harnesses import BashMinimalEnv as BME
 
