@@ -145,6 +145,14 @@ def _kill_tree(pid: int) -> None:
     spawned grandchildren (``bash -c 'python x.py'``) leaves them running, and
     on Windows they keep any inherited handles open — which is what turns a
     timeout into a hang (see ``_run_shell``).
+
+    On POSIX this signals the child's **process group**, which is only safe
+    because ``_run_shell`` starts the child with ``start_new_session=True`` so
+    that group contains nothing but the command's own tree. The guard below
+    refuses to signal our own group: without it, a future change that drops
+    ``start_new_session`` would make a timeout kill the caller — observed live,
+    as a CI job that sat ``in_progress`` for half an hour instead of failing,
+    because the step's own shell was killed along with the runaway command.
     """
     try:
         if os.name == "nt":
@@ -154,7 +162,12 @@ def _kill_tree(pid: int) -> None:
                 timeout=20,
             )
         else:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            pgid = os.getpgid(pid)
+            if pgid == os.getpgid(0):
+                # Same group as us: killpg would take down the caller.
+                os.kill(pid, signal.SIGKILL)
+            else:
+                os.killpg(pgid, signal.SIGKILL)
     except Exception:  # noqa: BLE001 - best-effort cleanup, never fatal
         pass
 
@@ -187,6 +200,12 @@ def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -
                 stdin=subprocess.DEVNULL,
                 stdout=sink,
                 stderr=subprocess.STDOUT,
+                # Its own session, so the child's process group contains only
+                # this command's tree. That is what makes `killpg` in
+                # `_kill_tree` safe: without it the group is shared with the
+                # caller, and a timeout would kill the whole harness process
+                # (and, in CI, the runner's own step shell).
+                start_new_session=True,
             )
         except OSError as exc:  # pragma: no cover - host dependent
             return f"[error] could not run command: {exc}"

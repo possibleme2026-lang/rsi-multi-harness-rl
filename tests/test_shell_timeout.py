@@ -25,6 +25,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -50,6 +51,23 @@ def timed(fn, *a, **kw):
     t = time.time()
     out = fn(*a, **kw)
     return out, time.time() - t
+
+
+def _kill_tree_is_guarded() -> bool:
+    """Does ``_kill_tree`` refuse to signal the caller's own process group?
+
+    Read from the source rather than exercised, because the failure mode is
+    "the caller dies" — there is no way to assert on that from inside the
+    caller. A source check is weak in general; here it is the only option, and
+    the property it guards (never SIGKILL your own process group) is not one a
+    refactor is likely to reproduce by accident.
+    """
+    import inspect
+
+    from multiharness.harnesses.core import _kill_tree
+
+    src = inspect.getsource(_kill_tree)
+    return "getpgid(0)" in src and "killpg" in src
 
 
 def main() -> int:
@@ -110,6 +128,43 @@ def main() -> int:
 
     out, _ = timed(_run_shell, "echo -n abc > out.txt && cat out.txt", cwd=tmp, timeout=10)
     check("file redirection works", out.strip() == "abc", repr(out.strip()[:40]))
+
+    # -- 5. the child must NOT share our process group --------------------
+    # This is the difference between a timeout that kills the runaway command
+    # and a timeout that kills the caller. `_kill_tree` signals the child's
+    # process group; if the child inherited ours, that group is the whole
+    # harness process -- and in CI, the runner's own step shell.
+    #
+    # Observed live: the first CI run of this repository sat `in_progress` for
+    # half an hour instead of failing. The step's shell had been killed by its
+    # own timeout cleanup, so the job never reported a result. A regression here
+    # is therefore silent, which is exactly why it needs its own assertion.
+    print("\n-- 5. child runs in its own process group (killpg cannot hit us) --")
+    if os.name == "nt":
+        print("  [skip] process groups are a POSIX concept; Windows uses taskkill /T")
+    else:
+        import subprocess as _sp
+
+        from multiharness.harnesses.core import BASH
+
+        child_pgid = _sp.run(
+            [BASH, "-c", "ps -o pgid= -p $$"],
+            capture_output=True, text=True, start_new_session=True,
+        ).stdout.strip()
+        our_pgid = str(os.getpgid(0))
+        check("a session-leader child gets a fresh pgid",
+              child_pgid != our_pgid, f"child={child_pgid} ours={our_pgid}")
+        # And the real thing: run through the harness and compare groups.
+        marker = tmp / "pgid.txt"
+        _run_shell(f"ps -o pgid= -p $$ | tr -d ' ' > {marker.name}", cwd=tmp, timeout=10)
+        if marker.is_file():
+            observed = marker.read_text(encoding="utf-8").strip()
+            check("_run_shell's child is in its own process group",
+                  observed != our_pgid, f"child={observed} ours={our_pgid}")
+            check("_kill_tree refuses to signal the caller's own group",
+                  _kill_tree_is_guarded(), "guard present in _kill_tree")
+        else:
+            check("pgid probe produced output", False, "no pgid.txt written")
 
     print("\n" + "=" * 74)
     # Best-effort: case 1 deliberately leaves a `sleep 300` alive, and on
