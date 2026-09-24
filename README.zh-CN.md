@@ -326,7 +326,7 @@ dead 0、欠测量 11。
 
 ![工具调用对奖励](docs/figures/fig08_toolcall_reward.png)
 
-**两张解析图——退火编辑预算，以及 harness 演化账本。**
+**退火预算（这是算出来的，不是测出来的），以及它约束的那份账本。**
 
 ![退火编辑预算](docs/figures/fig09_edit_budget.png)
 

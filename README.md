@@ -403,8 +403,8 @@ zeros.**
 
 ![tool calls vs reward](docs/figures/fig08_toolcall_reward.png)
 
-**The two analytic figures — the annealed budget, and the harness evolution
-ledger.**
+**The annealed budget, which is computed rather than measured, and the ledger it
+governs.**
 
 ![annealed edit budget](docs/figures/fig09_edit_budget.png)
 
