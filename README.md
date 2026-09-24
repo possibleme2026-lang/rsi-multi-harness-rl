@@ -503,11 +503,43 @@ rows, and `--dry-run` stops before the model loads so the wiring is checkable
 without a GPU.
 
 Why this matters for the training curve: the two 128-step arms trained on 64
-rows, which at 2 unique prompts per step is 16 epochs over sixteen frozen ids.
-The reward plateau past step 65 and the rise of `frac_reward_zero_std` to 0.66 are
-what memorisation looks like, not what a capability ceiling looks like. Generated
-tasks are the mechanism the repository already had for escaping that, and until
-now the gradient never saw one.
+rows drawn from sixteen frozen ids, which the logged `epoch` field puts at
+**4.0 epochs** (`epoch` is 0.03125 = 2/64 at step 1 and 4.0 at step 128). The
+reward plateau past step 65 and the rise of `frac_reward_zero_std` to 0.66 are
+consistent with memorisation of a small fixed set — and generated tasks are the
+mechanism the repository already had for escaping that. Note what is *not*
+claimed here: 4 epochs of a 0.5B model is not obviously enough to have saturated,
+so the plateau is evidence that this particular setup stopped improving, not proof
+that the task set is the only cause. It is proof that the gradient never saw a
+generated task, which is a defect regardless of what the plateau means.
+
+**The generated tasks' difficulty is measured, but thinly.** This is worth
+stating precisely, because it is easy to overclaim in either direction. The two
+scans of generated artifacts are:
+
+| artifact | what it measures | result | verdict |
+| --- | --- | --- | --- |
+| `rsi/scan_batch_smoke.json` | generated string tasks, `n=2`, one harness | **0/16** | `under_measured` (hi 0.1936) |
+| `rsi/env_scan.json` | generated environment tasks, pooled | **0/96** | `dead` (hi 0.0385) |
+
+So the *environment* batch is a genuine capability floor — 0/96 excludes any rate
+above 0.0385. The *string* batch is not: at `n=2` per cell its upper bound is
+0.1936, which overlaps the shipped suite's T1 rate of 0.3613 at the low end and
+its T3 rate of 0.0859 comfortably. A first draft of this section said the
+generator "produces tasks the policy cannot do", which the 0/16 scan does not
+support. What the shipped suite shows is a difficulty curve worth steering along:
+
+| tier | pooled pass rate (shipped suite, `n=32`) | verdict |
+| --- | --- | --- |
+| T1 | 370/1024 = **0.3613** | `live` |
+| T2 | 1/512 = **0.0020** | `dead` |
+| T3 | 44/512 = **0.0859** | `live` |
+
+and `sample_params` draws uniformly over four tiers, so roughly half of a
+generated batch lands in T4 — a tier the shipped suite never exercised at all.
+Whether that is too hard is the open question, and it is answerable by one scan
+of a generated batch at `n >= 32`. Until that exists, the honest statement is
+that the generator's calibration is unmeasured, not that it is wrong.
 
 ## Figures
 

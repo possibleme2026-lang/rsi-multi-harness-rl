@@ -142,13 +142,17 @@ before it.
      that measures none of the rows; `--dry-run` stops before the model loads so
      the wiring is checkable without a GPU.
   3. **The consequence was in the training curve.** Both 128-step arms trained on
-     64 rows, which at 2 unique prompts per step is 16 epochs over sixteen frozen
-     ids. The reward plateau past step 65 (0.500 / 0.492 / 0.527 / 0.516 across
-     the last four 16-step bins) and the climb of `frac_reward_zero_std` from
-     0.344 to 0.656 are what memorisation looks like — not a capability ceiling,
-     which is what the plateau had been read as. `tests/test_rsi_closed_loop.py`
-     pins all three properties: generation before the scan, the scan of that
-     batch, and both consumers reading it.
+     64 rows drawn from sixteen frozen ids — **4.0 epochs**, per the logged
+     `epoch` field (0.03125 = 2/64 at step 1, 4.0 at step 128). The reward
+     plateau past step 65 (0.500 / 0.492 / 0.527 / 0.516 across the last four
+     16-step bins) and `frac_reward_zero_std` climbing 0.344 -> 0.656 are
+     consistent with memorising a small fixed set. What is *not* claimed: 4
+     epochs of a 0.5B model is not obviously enough to have saturated, so the
+     plateau shows this configuration stopped improving, not that the task set is
+     its only cause. What the fix does establish is that the gradient never saw a
+     generated task — a defect regardless of what the plateau means.
+     `tests/test_rsi_closed_loop.py` pins all three properties: generation before
+     the scan, the scan of that batch, and both consumers reading it.
 - **The environment scan's before-picture was overwritten by its own re-scan.**
   Both wrote `outputs/rsi/env_scan.json`, and `probe.py` flushes after every cell,
   so the artifact that was the only evidence of the guidance defect was replaced
