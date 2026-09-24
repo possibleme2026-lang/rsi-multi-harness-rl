@@ -675,7 +675,7 @@ it now reports what the tasks use, with the requested count beside it.
 
 **A `DEAD` threshold that was a guess.** `stats.py`'s docstring said excluding the
 signal band at zero passes takes "roughly `n >= 128`". The true boundary is **73**
-(`wilson_interval(0, 73)[1] = 0.04999`; `n = 72` gives 0.0506). The gap is not
+(`wilson_interval(0, 73)[1] = 0.04999`; `n = 72` gives 0.0507). The gap is not
 cosmetic: 73 rollouts is a laptop-sized scan, 128 is where you stop and redesign.
 The docstring now states both boundaries and a test pins them.
 

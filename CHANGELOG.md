@@ -106,7 +106,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - **A `DEAD` threshold that was a guess.** `stats.py` said excluding the signal
   band at zero passes takes "roughly `n >= 128`". The true boundary is **73**
-  (`wilson_interval(0, 73)[1] = 0.04999`; `n = 72` gives 0.0506). The gap matters:
+  (`wilson_interval(0, 73)[1] = 0.04999`; `n = 72` gives 0.0507). The gap matters:
   73 is a laptop-sized scan, 128 is where you stop and redesign. The docstring
   now states both boundaries and tests pin them (`0/73` DEAD, `0/72` not,
   `1/110` DEAD, `1/109` not).

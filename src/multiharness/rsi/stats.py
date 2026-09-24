@@ -334,7 +334,7 @@ def classify_cell(
     ``DEAD`` is harder still: observing zero passes and still excluding the
     signal region takes ``n >= 73`` — that is the first ``n`` whose Wilson
     upper bound at ``passes = 0`` drops below ``SIGNAL_LO``
-    (``wilson_interval(0, 73)[1] = 0.04999``; ``n = 72`` gives 0.0506). With a
+    (``wilson_interval(0, 73)[1] = 0.04999``; ``n = 72`` gives 0.0507). With a
     single pass observed it takes ``n >= 110``, because ``1/n`` has to fall
     below the threshold with room for the interval's upper tail.
     ``tests/test_rsi_stats.py`` pins both boundaries.
