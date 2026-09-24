@@ -514,10 +514,21 @@ def fig_edit_budget() -> None:
 
 
 def fig_ledger() -> None:
-    """The evolution ledger: what was tried, and whether it cleared the floor."""
+    """The evolution ledger: what was tried, and whether it cleared the floor.
+
+    Draws the ``rollout`` ledger when one exists, because that is the mode whose
+    trajectory is measured rather than synthesised, and falls back to the
+    replayed one. Which is which is stated on the figure: the two trajectories
+    are both "a rising line", and only one of them means the harness improved.
+    """
     plt = _plt()
-    recs = _load_jsonl("outputs/rsi/ledger.jsonl")
-    if not recs:
+    replayed = _load_jsonl("outputs/rsi/ledger.jsonl")
+    measured = _load_jsonl("outputs_rollout/rsi/ledger.jsonl")
+    if measured:
+        recs, mode = measured, "rollout (measured)"
+    elif replayed:
+        recs, mode = replayed, "ledger-replay (synthetic trajectory)"
+    else:
         SKIPPED.append(("fig10_ledger", "no ledger recorded"))
         return
     fig, axes = plt.subplots(1, 2, figsize=(8.2, 3.6), gridspec_kw={"width_ratios": [1.25, 1]})
@@ -570,7 +581,11 @@ def fig_ledger() -> None:
         ax2.legend(fontsize=8.5)
     ax2.set_xlabel("attempts")
     ax2.set_title("Which component paid off", fontsize=10.5)
-    fig.suptitle("Every attempt is recorded, not only the successes", fontsize=11, y=1.03)
+    fig.suptitle(
+        f"Every attempt is recorded, not only the successes — score mode: {mode}",
+        fontsize=10.5,
+        y=1.03,
+    )
     _save(plt, fig, "fig10_ledger.png", "ledger trajectory and per-component yield")
 
 

@@ -426,6 +426,17 @@ train harnesses, and the effects are larger than sampling noise: single
 mean reward rose `0.367 → 0.488 → 0.520 → 0.508` across the four quarters of its
 64 steps, so it learned and then plateaued rather than merely drifting.
 
+**The multi arm's curve is less clean, and it is worth saying so.** It rose the
+same way — `0.227 → 0.313 → 0.441` — and then **fell back to 0.352** in its last
+quarter. Its mean over all 64 steps (`0.333`) is *below* single's (`0.471`), while
+its eval train-harness reward (`0.305`) is *above* single's (`0.266`). Those two
+facts are not contradictory — the training mean includes the early steps where
+four harnesses' worth of variance was being absorbed, and the eval reads only the
+final checkpoint — but a last-quarter decline is not a plateau, and 16 steps per
+quarter cannot separate a late-training regression from noise. The ablation
+numbers below are from the final checkpoint, so if that checkpoint is a local dip
+the multi arm's advantage is overstated. Nothing in this run rules that out.
+
 **The headline contrast is not significant, and the arithmetic says why.**
 `multi` beats `single` by `d = +0.0391`, `z = +0.69`. Because the held-out term
 is 0 in *every* arm, `d_gap ≡ d_train` exactly — the gap difference is the train
