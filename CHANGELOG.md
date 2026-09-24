@@ -9,6 +9,44 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Synthesised environment tasks** (`rsi/envgen.py`, `rsi/envtask.py`) — the
+  environment axis. A task is a *path through a tool dependency graph*
+  (`E = {F_exec, E_doc, Σ_tool}`, EnvScaler arXiv:2601.05808 §2) rather than a
+  parameter vector, and the reward is the fraction of K checkpoints satisfied by
+  the **final state**, so it is process-agnostic and carries gradient where a
+  boolean does not. Four domains (inventory / tickets / accounts / sensors),
+  `n_steps` counted in **mutations**, distractor injection so that "read the
+  state" is a real requirement.
+- **Harbor package export** (`rsi/harbor_export.py`) — a real `task.toml` +
+  `instruction.md` + `environment/` + `solution/` + `tests/` package per task,
+  with the verifier evaluator extracted from `harnesses.core` via
+  `inspect.getsource` so the exported and in-process graders **cannot** drift.
+- **Local Harbor runner** (`scripts/harbor_local_run.py`) — executes an exported
+  package without Docker by running the oracle, handing `state.json` to a
+  separate verifier directory, and grading both that and an untouched state.
+  Verified: **30/30 packages OK**, `reward=1.0` on the oracle, `untouched_rc=1`.
+  An unexecuted package is a claim; this is what makes it a benchmark.
+- **Harness-pool adapter** (`rsi/env_adapter.py`) — makes an environment task
+  runnable by the harness pool, with a declarative `env` template resolved at
+  `reset` so the batch survives a JSON round trip and each rollout gets its own
+  state file.
+- **Environment batch dump** (`outputs/rsi/env_batch.json`) so the harness scan
+  can run on **stateful** tasks rather than only on string tasks, plus
+  `scripts/env_harness_smoke.py` (scripted-policy smoke, 12/12 cells) and
+  `scripts/env_reward_ceiling.py` (proves the path reaches 1.0 and that partial
+  credit is fractional).
+- **Scan-shape analysis** (`scripts/env_scan_report.py`) — reads a scan artifact
+  and classifies every rollout by the *shape* of the call it made
+  (`no_call` / `bad_args` / `unknown_tool` / `query_only` / `wrong_target` /
+  `mutated_ok`), so a pass-rate matrix of zeros can be explained rather than
+  merely reported. It is what found the guidance defect above; a matrix of zeros
+  looks identical whether the model never called a tool, called a non-existent
+  one, or called the right one and stopped.
+- **Batch producer** (`scripts/env_batch_make.py`) — regenerates the environment
+  batch from a command. The batch that the first scan measured was produced by an
+  ad-hoc command that was never written down, so once its producer changed the
+  artifact could not be rebuilt; an artifact whose producer is a shell history
+  entry is not evidence. Refuses to overwrite a batch whose ids differ.
 - **Harness pool** of five agent harnesses that differ in the axes a policy must
   not depend on: system prompt, tool set, and submit protocol. Four are used for
   training (`bash_minimal`, `react_tools`, `json_strict`, `longctx_summary`); one
@@ -28,6 +66,133 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Training entry point** (`scripts/train.py`) for both arms of the ablation —
   single-harness and multi-harness — sharing all code except the environment
   list, so the arms differ in exactly one thing.
+
+### Measured — environment axis
+
+Numbers, including the ones that are not flattering. Each was produced by a
+script in `scripts/`, and each replaced a wrong number that had been reported
+before it.
+
+- **Discriminability, 30/30**: reference scores exactly `1.0`, initial state
+  exactly `0.0`, distractor trace strictly lower and `<= 0.6`. Measured on the
+  batch, not a fixture.
+- **Harbor packages, 30/30 execute locally** with `reward=1.0` on the oracle and
+  a non-zero exit for an untouched state. Before the tool table was completed,
+  **0/30** executed: `unknown tool: restore` on every package.
+- **`n_steps` ladder, 60 draws each**: `2 -> (chain 3, ref 2)`, `3 -> (4, 3)`,
+  `4 -> (5, 4)`, `5 -> refused on 60/60 seeds`. The knob was wrong three separate
+  times before this: chains padded with queries, chains padded with tools the
+  reference refuses, and a ceiling that varied with an unrecorded draw.
+- **Reward ceiling reached through the harness layer**: `0.00 -> 0.40 -> 1.00`
+  as the reference is applied call by call, with a partial attempt scoring
+  `0.40`. This is what licenses reading the scan below as a capability result
+  rather than a plumbing failure.
+- **Environment scan, 96 rollouts** (4 train harnesses x 12 tasks x 2), after the
+  guidance fix: **tool-call rate `96.9%`**, multi-turn uptake `100%`, pass rate
+  non-zero in two cells (`react_tools` scored `0.20` and `0.10` where the other
+  three harnesses scored `0.00`), so `G2` and `G3` now pass and the probe returns
+  **GO**. Before the fix the same scan was **`0.00` in every cell**.
+- **The guidance fix, measured directly** (`scripts/guidance_shape_check.py`,
+  same model, same tasks, one variable): the shape of the emitted call went
+  **`as_tool` 83% -> 12%** and **`correct` 17% -> 88%**. This is the measurement
+  that justifies the fix; the scan's pass rate alone would not, because a scan
+  can move for reasons other than the change under test.
+- **The `0.20` spread is NOT a measured cross-harness gap**
+  (`scripts/env_spread_significance.py`). It comes from **2 rollouts out of 96**:
+  `react_tools` at `1/2` on one task against `0/2` beside it. The Wilson interval
+  on that cell is `[0.09, 0.91]`, and the minimum detectable effect at `n=2/arm`
+  is `0.40` — larger than the observed `0.20`. So the design **cannot**
+  distinguish "no gap" from "a gap this size". It clears the pooled noise floor
+  (`0.0129`) and its interval excludes zero, which makes it a *lead*, not a
+  finding. Detecting an effect of this size needs **9 rollouts per arm**, 4x the
+  current `n`. Reported as a lead with its interval attached.
+- **Environment scan, 96 rollouts** (4 train harnesses x 12 tasks x 2), before the
+  guidance fix: **pass rate `0.00` in every cell**, tool-call rate `81.2%`,
+  multi-turn uptake `100%`. Reported at the time as a **floor**, not a gap:
+  `G3 cross-harness spread = 0.00`, so **no cross-harness gap is measurable on
+  this batch at this model size** — a floor is uniform across harnesses and a gap
+  requires a difference. That reading was correct as far as it went, and the
+  floor turned out to be a defect rather than the model: see the guidance entries
+  below. The artifact for this run was overwritten by the re-scan before it could
+  be archived; the numbers above are the ones extracted from it at the time.
+
+### Fixed — the defects behind those numbers
+
+- **The environment scan's before-picture was overwritten by its own re-scan.**
+  Both wrote `outputs/rsi/env_scan.json`, and `probe.py` flushes after every cell,
+  so the artifact that was the only evidence of the guidance defect was replaced
+  by the run meant to be compared against it. The numbers below survive because
+  they were extracted while it existed; the raw records do not. `env_batch_make.py`
+  now refuses to overwrite a batch whose ids differ, which is the same hazard one
+  step upstream.
+- **`env_scan_report`'s `mutated_ok` bucket was documented backwards** — as
+  "mutated and still scored 0", when it means "mutated and was paid". The
+  mislabelled reading sends you to audit the checkpoints at exactly the moment
+  the checkpoints have just been vindicated. It now also states the inference the
+  bucket licenses: a non-empty `mutated_ok` means the reward path works end to
+  end, so the zeros beside it are a capability floor rather than a plumbing
+  failure.
+- **`guidance_shape_check`'s first version measured itself.** It decoded the
+  completion with `skip_special_tokens=True` — stripping the `<tool_call>`
+  delimiters — and matched with its own regex, while the rollout loop parses at
+  the token level through `parse_response`. Both arms reported `100% no_call`
+  against a scan showing `100%` tool calls. It now routes through `agent._parse`,
+  the same entry point the loop uses, so it cannot pass while the real path
+  behaves differently.
+- **Every harness told the agent to write `answer.txt`.** Each harness appends a
+  static `GUIDANCE` block written for string tasks; for a stateful task it names
+  the wrong artifact (the verifier reads `state.json`) and never mentions
+  `envtool`, so the agent's only route to the environment was guessing tool
+  names. Measured: **96/96 rollouts scored 0.00** and tool-call rate was 35.4%.
+  Fixed by a per-task `guidance` override carrying the tool table, which
+  `core._instruction` prefers over the harness's static text.
+- **The first fix to that guidance did not fix it, and the metric it was
+  validated on moved the wrong way.** The override rendered the environment's
+  commands as a bare list (`envtool list_tickets`, `envtool set_state <id>
+  <value>`) — which reads as a *tool list*, and the prompt already contains one,
+  because the chat template renders the harness's own tools as a schema block
+  above the instruction. Given two lists of that shape the model merged them and
+  called `envtool list_tickets` **as a tool name**:
+
+  ```
+  envtool list_tickets({'query': 'state=open'})
+  -> Tool envtool list_tickets not found. Available: ['bash']
+  ```
+
+  Measured across the pool: **70% of all 96 rollouts** were that one shape, and
+  the model invented `list_accounts` / `list_items` on environments that have no
+  such command — it was answering the shape of the prompt, not its content. The
+  tool-call rate rose 35.4% → **81.2%** while the pass rate stayed at exactly
+  `0.00`, because **a call to a non-existent tool is still a tool call**. The
+  gate that was supposed to detect "the model can engage" was satisfied by the
+  failure mode itself. The guidance now introduces the commands as *shell command
+  lines*, names the shell tool they are reached through, and shows the wrong
+  shape explicitly; `scripts/env_scan_report.py` classifies the shape of every
+  call so a rise in the call rate can no longer be read as progress on its own.
+- **The exported `tools.py` was missing two tools** (`restore`, `pin`) that the
+  in-process grader implements, so the exported environment and the solution
+  driving it had drifted — the two-implementations hazard the module docstring
+  names, and invisible to any test that compares scores, since both sides keep
+  returning plausible numbers. Caught by the local runner, not the suite.
+- **A callable in the task dict made the batch undumpable**
+  (`TypeError: Object of type function is not JSON serializable`), so the
+  environment batch could not be written and the gap could only ever be measured
+  on string tasks. Replaced by a declarative `env` template.
+- **The tool set was drawn per seed**, so `n_steps`' *legality* depended on an
+  unrecorded draw — `n_steps=5` was refused for "3 usable mutators" on 27 of 60
+  seeds and "4 usable mutators" on 33. The set is now fixed per domain.
+- **`reset_<f2>` could not raise the chain ceiling** because it writes a field
+  `set_<f2>` already owns, and two steps writing one field is a redundant step.
+  Replaced by `pin`, which writes `_pin`, a field nothing else reaches.
+- **`_touched_fields` was referenced before it existed** (module-level
+  `NameError`), and its first version's stem split made `count_by_sku` look
+  unimplemented on a package that implements it.
+
+### Notes
+
+- `scripts/_probe_steps.py` is a throwaway diagnostic kept in-tree because the
+  `n_steps` ladder is the measurement that caught three of the bugs above; it is
+  not part of the pipeline.
 - **Evaluation sweep** (`scripts/eval.py`) that runs the base model and both
   checkpoints in one process, against held-out tasks *and* the held-out harness,
   and reports the ablation with per-cell live counts.

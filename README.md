@@ -641,6 +641,11 @@ src/multiharness/
   harnesses/pool.py     the five harnesses
   tasks/suite.py        the 24 tasks, and the train/eval split
   rsi/task_gen.py       axis 1 — generate task, environment, and reference
+  rsi/envgen.py         axis 4 — synthesise a *stateful environment*: the tool
+                        dependency graph, the initial state, and the chain
+  rsi/envtask.py        a task as a path through that graph, graded on the state
+  rsi/harbor_export.py  the Harbor package for one such task
+  rsi/env_adapter.py    the same task, in the shape the harness pool runs
   rsi/verifier_gen.py   axis 2 — generate the reward, in one of three modes
   rsi/validate.py       gates V1-V4
   rsi/harness_evolve.py axis 3 — descriptor edits, guard, judge
@@ -650,7 +655,9 @@ src/multiharness/
   rsi/curriculum.py     the alpha-reward, and the plan that closes the loop
   rollout.py            a standalone re-implementation of TRL's tool-calling loop
   _bootstrap.py         repo root + artifact directory
-scripts/                entry points (probe, rsi_loop, train, eval, guards)
+scripts/                entry points (probe, rsi_loop, train, eval, guards,
+                        harbor_local_run, env_batch_make, env_harness_smoke,
+                        env_reward_ceiling, env_scan_report, guidance_shape_check)
 tests/                  smoke tests and regression tests
 tools/                  plotting, figure check, README i18n parity guard
 docs/refs/              what was borrowed from RRSI, Dream-RSI, and the
@@ -663,6 +670,85 @@ pipeline.sh             the full run, in dependency order
 Each was found by measurement disagreeing with expectation, and each has a
 regression test. They are in the README because every one of them silently
 corrupts a result rather than crashing.
+
+**Every harness told the agent to write `answer.txt`, and 96 of 96 rollouts
+scored 0.00 because of it.** This is the worst bug in this file: not because of
+its size, but because it produced a *complete, plausible, entirely false*
+capability result. Each harness appends a static `GUIDANCE` block — written for
+string tasks, and correct for them — saying to submit by writing `answer.txt`.
+A stateful environment task is graded on `state.json`, so a perfect solution
+would have scored 0.0; and the block never mentioned `envtool`, so the agent's
+only route to the environment was guessing tool names. The transcripts show
+exactly that: `update_inventory_item_by_id: command not found`,
+`cat /var/log/syslog`, `echo "set balance to closed"`.
+
+The Harbor export path did not have this bug, because `_instruction_md` renders
+a tool table. That table is built in `harbor_export` and never reaches the
+harness pool — the pool reads a task *dict*, not a package — so the two paths
+diverged and **only one of them was ever executed**. The fix is a per-task
+`guidance` override that `core._instruction` prefers over the static block.
+
+**The first fix did not fix it, and the number it was validated on went up.**
+The override rendered the environment's commands as a bare list —
+`envtool list_tickets`, `envtool set_state <id> <value>`. That reads as a *tool
+list*, and the prompt already contains one, because the chat template renders the
+harness's own tools as a schema block above the instruction. Given two lists of
+that shape, the model merged them and called `envtool list_tickets` **as a tool
+name**:
+
+```
+envtool list_tickets({'query': 'state=open'})
+-> Tool envtool list_tickets not found. Available: ['bash']
+```
+
+Measured across the pool: **70% of all 96 rollouts** were that one shape, and the
+model invented `list_accounts` and `list_items` on environments that have no such
+command — it was answering the shape of the prompt, not its content. Meanwhile
+the tool-call rate went 35.4% → **81.2%** and the pass rate stayed at exactly
+`0.00`, because **a call to a non-existent tool is still a tool call**. The gate
+meant to detect "the model can engage at all" was satisfied by the failure mode
+it was supposed to catch. A gate a wrong call satisfies is not a gate.
+
+The guidance now introduces the commands as *shell command lines*, names the
+shell tool they are reached through, and shows the wrong shape explicitly as
+wrong. `scripts/env_scan_report.py` classifies the shape of every call
+(`no_call` / `bad_args` / `unknown_tool` / `query_only` / `wrong_target` /
+`mutated_ok`) so the call rate can no longer be read as progress on its own —
+which is how this was found at all. A matrix of zeros looks identical whether the
+model never called a tool, called a non-existent one, or called the right one and
+stopped.
+
+**A package that audits clean and cannot run.** `audit_package` checked that
+`environment/assets/tools.py` existed, was well-formed, and listed the right
+tools — all true. It did not check that the tools were *dispatchable*, and two
+were not: `restore` and `pin` were implemented in the in-process grader
+(`envtask.apply_trace`) and missing from the exported program, so the exported
+environment and the solution driving it had drifted. Measured: **0 of 30
+packages executed**, `unknown tool: restore` on every one. The test suite was
+green throughout, because a structural audit and a score comparison both keep
+succeeding while the thing they describe is broken. The local runner caught it.
+The lesson is the one this repository keeps relearning: **an unexecuted package
+is a claim, not a benchmark.**
+
+**The difficulty knob lied three times, in three different ways.** `n_steps` is
+the environment axis's only difficulty knob, and each fix revealed the next
+layer: (1) chains were padded with *queries*, which contribute no reference step
+and no checkpoint, so a 4-step chain graded a 1-step solution; (2) chains were
+padded with tools the reference *refuses to use* (`reset_log`, `bulk_update`), so
+43% of tasks had a 4-step chain and a 1-step reference; (3) the ceiling itself
+varied with an unrecorded draw, so `n_steps=5` was refused for "3 usable
+mutators" on 27 of 60 seeds and "4 usable mutators" on 33 — the knob's
+*legality* depended on a seed. The ladder is now 60/60 deterministic per
+setting and 60/60 refused above the ceiling.
+
+**A callable in a task dict made the batch unwritable.** `env_adapter` put a
+`lambda` in the `env` key to point each rollout at its own state file — correct
+in spirit, and it made `json.dumps` raise, so the environment batch could not be
+written and the cross-harness gap could only ever be measured on string tasks.
+The fix is a declarative template resolved at `reset`. The *dangerous* fix would
+have been to drop the key: without `ENVTOOL_STATE` every rollout reads the same
+default path, so all rollouts silently share one state file — an environment that
+appears to work while coupling every rollout to every other.
 
 **A subprocess deadlock worth 84 minutes of idle GPU.** The shell runner used
 `subprocess.run(capture_output=True, timeout=...)`. When the timeout fires, that

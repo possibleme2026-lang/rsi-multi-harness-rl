@@ -66,8 +66,14 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from multiharness._bootstrap import outputs_root  # noqa: E402
 from multiharness.rsi import curriculum as cu  # noqa: E402
+from multiharness.rsi import (  # noqa: E402
+    env_adapter,
+    envtask,
+    harbor_export,
+    task_gen,
+    validate,
+)
 from multiharness.rsi import harness_evolve as he  # noqa: E402
-from multiharness.rsi import task_gen, validate  # noqa: E402
 from multiharness.rsi.ledger import Ledger, edit_budget  # noqa: E402
 from multiharness.rsi.stats import noise_floor  # noqa: E402
 
@@ -80,6 +86,149 @@ from multiharness.rsi.stats import noise_floor  # noqa: E402
 #: override silently applied to only part of a run. ``outputs_root`` is the
 #: single definition; the ``rsi`` subdirectory is this script's own namespace.
 OUT = outputs_root() / "rsi"
+
+
+# --------------------------------------------------------------------------
+# the environment axis
+# --------------------------------------------------------------------------
+
+
+def run_env_axis(
+    n_envs: int,
+    seed: int,
+    root: Path,
+    *,
+    n_records: int,
+    n_distractors: int,
+    n_steps: int,
+    export: bool,
+) -> dict:
+    """Synthesise stateful environment tasks, gate them, and optionally export them.
+
+    This is the axis the string task generator cannot provide. Where
+    ``run_task_axis`` produces prompts whose only effect is the contents of one
+    file, this produces **stateful systems** the agent acts on through named
+    tools, and grades the state it leaves behind. The three discriminability
+    checks below are the analogue of gates V1/V2 for a state-based reward, and
+    they are strictly stronger than the string versions:
+
+    *reference*  the reference trace must score exactly 1.0 — otherwise the
+                 environment is inconsistent with its own checkpoints;
+    *initial*    the untouched state must score 0.0 — otherwise the task is
+                 already solved, or a checkpoint passes vacuously;
+    *distractor* a trace applied to the *wrong* record must score strictly less
+                 than the reference — otherwise the distractors are decorative
+                 and an agent that cannot read the state scores the same as one
+                 that can. This third check has no analogue in the string
+                 generator, because a string task has nothing to confuse.
+
+    Every one of those three was violated by an early version of the generator,
+    which is why they are run on the whole batch rather than spot-checked. The
+    measured failures are recorded in ``envgen``/``envtask``'s docstrings.
+    """
+    print("=" * 74)
+    print("ENVIRONMENT AXIS — synthesise stateful tasks, then try to falsify each")
+    print("=" * 74)
+    t0 = time.time()
+    tasks = envtask.generate_env_batch(
+        n_envs,
+        seed=seed,
+        n_records=n_records,
+        n_distractors=n_distractors,
+        n_steps=n_steps,
+    )
+    cov = envtask.summarise_env_batch(tasks)
+    print(f"synthesised {cov['total']} environment tasks in {time.time() - t0:.1f}s")
+    print(f"  by domain        : {cov['by_domain']}")
+    print(f"  edges by reason  : {cov['edges_by_reason']}   (data_flow / precondition / state)")
+    print(f"  checkpoints      : min {cov['checkpoints_min']}  max {cov['checkpoints_max']}  "
+          f"mean {cov['checkpoints_mean']}")
+    print(f"  with distractors : {cov['with_distractors']}")
+    print()
+
+    t0 = time.time()
+    rows: list[dict] = []
+    bad = {"reference": 0, "initial": 0, "distractor": 0, "ambiguous": 0}
+    for t in tasks:
+        cps = list(t.checkpoints)
+        ref_state = envtask.apply_trace(t.instance, list(t.trace))
+        ref = envtask.grade_state(t.instance, ref_state, cps)
+        init = envtask.grade_state(t.instance, t.instance.initial_state, cps)
+        wrong_state = envtask.plausible_wrong_state(t.instance, list(t.trace))
+        wrong = envtask.grade_state(t.instance, wrong_state, cps)
+
+        ok_ref = ref == 1.0
+        ok_init = init == 0.0
+        ok_wrong = wrong < ref
+        if not ok_ref:
+            bad["reference"] += 1
+        if not ok_init:
+            bad["initial"] += 1
+        if not ok_wrong:
+            bad["distractor"] += 1
+
+        rows.append({
+            "task_id": t.task_id,
+            "domain": t.instance.spec.domain,
+            "chain": list(t.instance.chain),
+            "checkpoints": t.checkpoint_count,
+            "grade_reference": ref,
+            "grade_initial": init,
+            "grade_distractor": wrong,
+            "discriminates": ok_ref and ok_init and ok_wrong,
+        })
+    print(f"discriminability checked in {time.time() - t0:.1f}s")
+    n_ok = sum(1 for r in rows if r["discriminates"])
+    print(f"  reference scores 1.0    : {len(rows) - bad['reference']}/{len(rows)}")
+    print(f"  initial scores 0.0      : {len(rows) - bad['initial']}/{len(rows)}")
+    print(f"  distractor scores less  : {len(rows) - bad['distractor']}/{len(rows)}")
+    print(f"  all three               : {n_ok}/{len(rows)}")
+    print()
+
+    # The trust boundary is audited on every task, not sampled: the leak it
+    # prevents (the oracle readable from the agent's own image) is silent, and a
+    # sampled audit would report a clean package while shipping a leaky one.
+    audit = harbor_export.audit_batch(tasks)
+    print(f"harbor package audit: {audit['ok']}/{audit['total']} clean")
+    if audit["problems_by_kind"]:
+        print(f"  problems: {audit['problems_by_kind']}")
+    if audit["warnings"]:
+        print(f"  warnings: {audit['warnings']}")
+    print()
+
+    exported: list[str] = []
+    if export:
+        dest = root / "harbor"
+        paths = harbor_export.write_harbor_batch(tasks, dest)
+        exported = [str(p) for p in paths]
+        print(f"exported {len(exported)} Harbor task packages to {dest}")
+        print(f"  e.g. {exported[0]}")
+        print()
+
+    # The environment batch is dumped in the *harness-pool* shape, not the
+    # Harbor shape, and the difference is the whole point of this file. The
+    # Harbor packages are the deliverable — what a container runner consumes.
+    # The harness pool runs on the host, and `probe.py --from-batch` reads a list
+    # of task dicts. Without this dump there is no way to scan an environment
+    # batch, so the cross-harness gap could only ever be measured on string
+    # tasks — which is the weaker finding the environment axis exists to
+    # replace. Written unconditionally: it is small, and a run that exported
+    # nothing is exactly the run most likely to want it.
+    env_batch = env_adapter.as_harness_batch(tasks)
+    env_batch_path = root / "env_batch.json"
+    env_batch_path.write_text(json.dumps(env_batch, indent=2), encoding="utf-8")
+    print(f"wrote {env_batch_path}  ({len(env_batch)} environment tasks; scan it with "
+          f"`probe.py --from-batch {env_batch_path}`)")
+
+    return {
+        "coverage": cov,
+        "tasks": rows,
+        "discriminable": n_ok,
+        "failures": bad,
+        "audit": audit,
+        "exported": exported,
+        "env_batch": str(env_batch_path),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -552,6 +701,19 @@ def main() -> int:
     ap.add_argument("--curriculum-k-min", type=float, default=cu.DEFAULT_K_MIN)
     ap.add_argument("--curriculum-max-moves", type=int, default=8,
                     help="cap on tasks regenerated in one round; 0 means no cap")
+    # The environment axis. Off by default because it is a different *kind* of
+    # task (stateful, graded on a final state) rather than a different batch of
+    # the same kind, and a run should say which one it measured.
+    ap.add_argument("--env-batch", type=int, default=0,
+                    help="synthesise this many stateful environment tasks (0 = skip)")
+    ap.add_argument("--env-records", type=int, default=4,
+                    help="relevant records per synthesised environment")
+    ap.add_argument("--env-distractors", type=int, default=3,
+                    help="irrelevant records; the knob that makes reading the state necessary")
+    ap.add_argument("--env-steps", type=int, default=4,
+                    help="tool-chain length, i.e. the depth of the dependency path")
+    ap.add_argument("--env-export", action="store_true",
+                    help="write Harbor task packages under outputs/rsi/harbor")
     args = ap.parse_args()
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -573,6 +735,26 @@ def main() -> int:
     task_result = run_task_axis(args.task_batch, args.seed, OUT)
     (OUT / "validation.json").write_text(json.dumps(task_result, indent=2), encoding="utf-8")
     print(f"wrote {OUT / 'validation.json'}\n")
+
+    # The environment axis runs before the harness axis because its artifact is
+    # the benchmark the harness numbers are read against: "0.03 on generated
+    # string tasks" and "0.03 on stateful environment tasks" are different
+    # findings, and a run that reported only the first would be claiming the
+    # weaker one.
+    if args.env_batch > 0:
+        env_result = run_env_axis(
+            args.env_batch,
+            args.seed,
+            OUT,
+            n_records=args.env_records,
+            n_distractors=args.env_distractors,
+            n_steps=args.env_steps,
+            export=args.env_export,
+        )
+        (OUT / "env_validation.json").write_text(
+            json.dumps(env_result, indent=2), encoding="utf-8"
+        )
+        print(f"wrote {OUT / 'env_validation.json'}\n")
 
     # The batch is generated once and shared: the curriculum steers *this*
     # batch, and the harness axis scores against it. Generating a second batch

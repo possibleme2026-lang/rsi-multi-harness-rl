@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import inspect
+import json
 import os
 import shutil
 import signal
@@ -172,18 +173,26 @@ def _kill_tree(pid: int) -> None:
         pass
 
 
-def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -> str:
+def _run_shell(
+    command: str,
+    cwd: str | Path,
+    timeout: int = _SHELL_TIMEOUT_S,
+    env: dict[str, str] | None = None,
+) -> str:
     """Run one shell command in *cwd* and return its combined output.
 
     The output-only form. Callers that need the exit status must use
     :func:`_run_shell_rc` — see the note there on why the text is not a
     faithful carrier of it.
     """
-    return _run_shell_rc(command, cwd, timeout)[0]
+    return _run_shell_rc(command, cwd, timeout, env)[0]
 
 
 def _run_shell_rc(
-    command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S
+    command: str,
+    cwd: str | Path,
+    timeout: int = _SHELL_TIMEOUT_S,
+    env: dict[str, str] | None = None,
 ) -> tuple[str, int | None]:
     """Run one shell command in *cwd*. Non-stateful, like mini-swe-agent.
 
@@ -222,6 +231,13 @@ def _run_shell_rc(
     if BASH is None:
         return "[error] no POSIX bash found on this host; set MULTIHARNESS_BASH", None
 
+    # `env=None` inherits the parent's environment, which is what every shipped
+    # task wants. A stateful task passes an explicit mapping so `envtool` is on
+    # PATH and `tools.py` knows where the state lives. Note this *replaces*
+    # rather than merges: the caller is responsible for carrying through PATH,
+    # and `env_adapter.environment_path` does.
+    run_env = None if env is None else {**env}
+
     with tempfile.TemporaryFile() as sink:
         try:
             proc = subprocess.Popen(
@@ -230,6 +246,7 @@ def _run_shell_rc(
                 stdin=subprocess.DEVNULL,
                 stdout=sink,
                 stderr=subprocess.STDOUT,
+                env=run_env,
                 # Its own session, so the child's process group contains only
                 # this command's tree. That is what makes `killpg` in
                 # `_kill_tree` safe: without it the group is shared with the
@@ -284,23 +301,128 @@ def _read_answer(workdir: Path) -> str | None:
     return p.read_text(encoding="utf-8", errors="replace")
 
 
+#: Where a *stateful* task's final state is read from, and the seed it starts
+#: from. Kept here rather than in the rsi layer because the verifier has to
+#: reach them without importing a module that imports the verifier — the
+#: dependency arrow points ``rsi -> harnesses``, not the other way.
+STATE_NAME = "state.json"
+INITIAL_STATE_NAME = "initial_state.json"
+
+
 def _answer_stamp(workdir: Path) -> str | None:
-    """Content fingerprint of ``answer.txt``, or ``None`` when absent.
+    """Content fingerprint of the graded artifact, or ``None`` when absent.
 
     Used as the reward cache key. Hashing the bytes rather than the mtime
     matters: two consecutive writes inside one filesystem timestamp tick would
-    otherwise collide, and the answer file is tiny so the cost is nil.
+    otherwise collide, and the artifact is tiny so the cost is nil.
+
+    Covers **both** ``answer.txt`` and a stateful task's ``state.json``. Reading
+    only the answer file was correct while every task was a question; once a
+    task is graded on state, a rollout that never writes ``answer.txt`` would
+    have a permanent cache key of ``None``, and ``get_reward`` would freeze its
+    first (failing) verdict — a task the agent subsequently solved would keep
+    reporting 0.
     """
-    p = workdir / ANSWER_NAME
+    parts = []
+    for name in (ANSWER_NAME, STATE_NAME):
+        p = workdir / name
+        try:
+            parts.append(hashlib.sha1(p.read_bytes()).hexdigest())
+        except OSError:
+            parts.append("-")
+    return "|".join(parts)
+
+
+def evaluate_checkpoint(cp: dict, state: dict) -> bool:
+    """Evaluate one declarative checkpoint against a final state.
+
+    Total: a missing key, a wrong type, or a malformed state evaluates to
+    ``False`` rather than raising. A raise inside ``get_reward`` aborts the
+    rollout, so an exception here would make a malformed state look like a
+    crashed run instead of a failed attempt — and "the model produced a weird
+    state" is a normal, expected outcome that must be *scored*, not thrown.
+
+    This is the **single** implementation. ``rsi/envtask.py`` imports it, and
+    ``rsi/harbor_export.py`` inlines its source into the exported verifier; the
+    three used to be separate copies, which is a drift risk that fails silently
+    (all three keep returning plausible scores). ``tests/test_rsi_envgen.py``
+    asserts the inlined copy agrees with this one.
+    """
     try:
-        data = p.read_bytes()
-    except OSError:
-        return None
-    return hashlib.sha1(data).hexdigest()
+        a = cp.get("args") or {}
+        kind = cp["kind"]
+
+        if kind == "target_field":
+            rec = next((r for r in state.get("records", []) if r.get("_id") == a["id"]), None)
+            if rec is None:
+                return False
+            return all(str(rec.get(f)) == str(v) for f, v in a["fields"].items())
+
+        if kind == "target_only":
+            return set(state.get("_changed", [])) == {a["id"]}
+
+        if kind == "log_recorded":
+            return any(
+                e.get("id") == a["id"] and e.get("field") == a["field"]
+                for e in state.get("log", [])
+            )
+
+        if kind == "meta_consistent":
+            entries = state.get("log", [])
+            # `>= 1` is load-bearing: "counter == len(log)" is `0 == 0` on an
+            # untouched state, i.e. trivially true. That one vacuous predicate
+            # was the entire reason the initial state scored 0.2-0.25 instead of
+            # 0.0. A state with no change cannot satisfy a condition about a
+            # change having been recorded.
+            return len(entries) >= 1 and int(state.get("meta", {}).get("changed", -1)) == len(entries)
+
+        if kind == "order_observable":
+            got = list(state.get("_order", []))
+            # Same guard, same reason: an untouched state has no order, and
+            # "no order equals no order" would otherwise be true for free.
+            return len(got) > 0 and got == list(a["order"])
+
+        return False
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def grade_state(state: dict, checkpoints: list[dict]) -> float:
+    """Fraction of checkpoints satisfied. The reward for a stateful task.
+
+    ``0/0`` returns 0.0 rather than 1.0. A task with an empty checkpoint list is
+    a generation bug, and scoring it 1.0 would make the bug look like the
+    easiest task in the suite — the V2 failure (a reward that always fires)
+    arriving through a different door.
+    """
+    if not checkpoints:
+        return 0.0
+    passed = sum(1 for cp in checkpoints if evaluate_checkpoint(cp, state))
+    return passed / len(checkpoints)
+
+
+def _read_state(workdir: Path) -> dict | None:
+    """The agent's final state, falling back to the seed when it never acted.
+
+    Falling back matters: an agent that does nothing leaves no ``state.json``,
+    and returning ``None`` would grade as a crash. Grading the *seed* instead
+    produces the honest answer — 0.0, because no checkpoint about a change can
+    be satisfied by the state nothing happened to. That also makes the
+    no-op case and the "agent never started" case score identically, which they
+    should.
+    """
+    for name in (STATE_NAME, INITIAL_STATE_NAME):
+        p = workdir / name
+        if p.is_file():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+    return None
 
 
 def verify(task: dict, workdir: Path) -> float:
-    """Return 1.0 / 0.0. Never inspects which harness produced the answer."""
+    """Return the reward. Never inspects which harness produced the answer."""
     mode = task.get("verify", "file_equals")
 
     if mode == "file_equals":
@@ -316,6 +438,19 @@ def verify(task: dict, workdir: Path) -> float:
         if got is None:
             return 0.0
         return 1.0 if str(task["expected"]).strip() in got else 0.0
+
+    if mode == "state_checkpoints":
+        # A *fractional* reward, unlike every other mode. That is deliberate and
+        # is the reason the environment axis exists: the GRPO group signal
+        # `1 - p^G - (1-p)^G` vanishes as `p` approaches 0, and a 0.5B model on
+        # a multi-step stateful task sits near `p = 0`. A boolean reward there
+        # makes every group identical and the gradient exactly zero, so the
+        # fractional form is a *training* requirement rather than a reporting
+        # preference. See `rsi/envtask.py` for the full argument.
+        state = _read_state(workdir)
+        if state is None:
+            return 0.0
+        return grade_state(state, task.get("checkpoints") or [])
 
     if mode == "python_exit":
         script = task.get("check_script")
@@ -404,6 +539,11 @@ class BaseHarnessEnv:
         self._reward_stamp: float | None = None
         self._turns = 0
         self._submitted: str | None = None
+        #: Extra environment for tool invocations. Populated by ``reset`` from
+        #: the task's ``env`` key, which a stateful task uses to put its own
+        #: ``envtool`` on PATH. Empty for every shipped task, so the shipped
+        #: behaviour is unchanged.
+        self._env: dict[str, str] = {}
 
     # -- TRL lifecycle -----------------------------------------------------
 
@@ -418,7 +558,73 @@ class BaseHarnessEnv:
         self._turns = 0
         self._submitted = None
         self._materialise_task_files()
+        # Built after the files exist, because the variables point *at* them.
+        self._env = self._build_env()
         return self._instruction()
+
+    def _build_env(self) -> dict[str, str]:
+        """The environment for this rollout's tool calls.
+
+        A task may carry an ``env`` key naming the variables it needs; a
+        stateful task's adapter supplies ``PATH`` (so ``envtool`` resolves) and
+        ``ENVTOOL_STATE`` (so the tools write into *this* rollout's directory
+        instead of the container path they default to).
+
+        Three accepted forms, and the third is the one that matters:
+
+        * ``None`` — inherit the process environment.
+        * a **callable** — called with this rollout's workdir.
+        * a **template dict** — string values may contain ``{workdir}`` and
+          ``{python_dir}``, and the reserved key ``_path_prefix`` lists entries
+          to prepend to the inherited ``PATH``.
+
+        The template exists because a callable cannot be serialised, and a task
+        batch *is* serialised: ``probe.py --from-batch`` reads task dicts from
+        JSON, and a callable would either crash the dump or be dropped. Dropping
+        it is the dangerous half — without ``ENVTOOL_STATE`` every rollout reads
+        the same default path, so all rollouts silently share one state file and
+        the scan reports a plausible number for an experiment that was not run.
+        Resolution happens here, at ``reset``, so the workdir is the rollout's
+        own rather than whichever directory existed at export time.
+
+        Kept as an overridable method rather than inlined into ``reset`` so a
+        harness can add its own variables without the base class knowing what
+        they mean. Deliberately *not* importing the adapter: the arrow points
+        ``rsi -> harnesses``, and the template is the interface that keeps it
+        that way.
+        """
+        assert self._workdir is not None and self._task is not None
+        spec = self._task.get("env")
+        if spec is None:
+            return {}
+        if callable(spec):
+            spec = spec(self._workdir)
+
+        workdir = self._workdir
+        subs = {"workdir": str(workdir), "python_dir": str(Path(sys.executable).parent)}
+
+        def resolve(v: str) -> str:
+            try:
+                return v.format(**subs)
+            except (KeyError, IndexError):
+                # A literal brace the task meant literally. Left as-is rather
+                # than raising: an env var that fails to expand is not worth
+                # aborting a rollout over, and the task is still runnable.
+                return v
+
+        out: dict[str, str] = {}
+        prefix: list[str] = []
+        for k, v in dict(spec).items():
+            if k == "_path_prefix":
+                prefix = [resolve(str(p)) for p in (v or [])]
+                continue
+            out[str(k)] = resolve(str(v))
+
+        if prefix:
+            inherited = os.environ.get("PATH", "")
+            parts = prefix + ([inherited] if inherited else [])
+            out["PATH"] = os.pathsep.join(parts)
+        return out
 
     @property
     def reward(self) -> float:
@@ -451,9 +657,33 @@ class BaseHarnessEnv:
     # -- internals ---------------------------------------------------------
 
     def _instruction(self) -> str:
+        """The task text plus the harness's guidance.
+
+        A task may override the guidance with its own ``guidance`` key, and the
+        override is not a convenience. Each harness's ``GUIDANCE`` is static text
+        written for *string* tasks: it says to submit by writing ``answer.txt``,
+        and it lists a fixed tool set. For a stateful environment task both are
+        wrong — the verifier reads ``state.json``, and the tools are the
+        environment's, not the harness's — so a stateful task that inherited the
+        static block was unsolvable by construction while looking merely hard.
+
+        Measured: the first scan of an environment batch scored 0.00 in all 96
+        cells across four harnesses. The transcripts show the model inventing
+        tool names and echoing a command as if it were a mutation, because the
+        only description of the environment it ever received was the instruction
+        prose. The Harbor export path renders a tool table and does not have this
+        bug; the harness-pool path had no equivalent, which is what this closes.
+
+        The *harness's* own tool description is still true and is not replaced —
+        only the submission protocol is, which is why the override lives on the
+        task rather than in the harness.
+        """
         task = self._task or {}
         parts = [task.get("instruction", "")]
-        if self.GUIDANCE:
+        override = task.get("guidance")
+        if override:
+            parts.append(str(override).strip())
+        elif self.GUIDANCE:
             parts.append(self.GUIDANCE.strip())
         return "\n\n".join(p for p in parts if p)
 
@@ -464,6 +694,13 @@ class BaseHarnessEnv:
             dest = self._workdir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
+            # Best effort: a shipped shell script (a stateful task's `envtool`)
+            # needs the bit on POSIX. Windows has no mode bits and this is a
+            # no-op there, which is fine — the shim is run through `sh` and the
+            # container image sets the bit at build time.
+            if rel.endswith(".sh") or content.startswith("#!"):
+                with contextlib.suppress(OSError):
+                    dest.chmod(dest.stat().st_mode | 0o111)
 
     def _write_answer(self, answer: str) -> None:
         assert self._workdir is not None
@@ -473,7 +710,7 @@ class BaseHarnessEnv:
     def _exec(self, command: str, timeout: int = _SHELL_TIMEOUT_S) -> str:
         assert self._workdir is not None, "reset() must run before tools"
         self._turns += 1
-        return _run_shell(command, cwd=self._workdir, timeout=timeout)
+        return _run_shell(command, cwd=self._workdir, timeout=timeout, env=self._env or None)
 
     # -- the universal tool ------------------------------------------------
 

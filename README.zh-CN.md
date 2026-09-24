@@ -531,6 +531,10 @@ src/multiharness/
   harnesses/pool.py     五个 harness
   tasks/suite.py        24 个任务，以及 train/eval 切分
   rsi/task_gen.py       轴一 —— 生成任务、环境与参考解法
+  rsi/envgen.py         轴四 —— 合成**有状态环境**：工具依赖图、初始状态、链路
+  rsi/envtask.py        任务即图上的一条路径，按留下的状态评分
+  rsi/harbor_export.py  这样一个任务的 Harbor 包
+  rsi/env_adapter.py    同一个任务，换成 harness 池能跑的形态
   rsi/verifier_gen.py   轴二 —— 生成奖励，三种模式之一
   rsi/validate.py       闸门 V1-V4
   rsi/harness_evolve.py 轴三 —— 描述符改动、守卫、评判
@@ -540,7 +544,9 @@ src/multiharness/
   rsi/curriculum.py     α 奖励，以及闭合回路的那份计划
   rollout.py            独立重实现的 TRL 工具调用循环
   _bootstrap.py         仓库根目录 + 产物目录
-scripts/                入口脚本（probe、rsi_loop、train、eval、守卫）
+scripts/                入口脚本（probe、rsi_loop、train、eval、守卫、
+                        harbor_local_run、env_batch_make、env_harness_smoke、
+                        env_reward_ceiling、env_scan_report、guidance_shape_check）
 tests/                  smoke 测试与回归测试
 tools/                  绘图、图表校验、README 双语一致性守卫
 docs/refs/              从 RRSI、Dream-RSI 与环境合成文献借了什么、为什么
@@ -551,6 +557,61 @@ pipeline.sh            完整运行流程，按依赖顺序
 
 每一个都是"实测与预期不符"发现的，每一个都有回归测试。写进 README 是因为它们全都会静默污染
 结果，而不是崩溃。
+
+**每个 harness 都叫 agent 去写 `answer.txt`，于是 96 个 rollout 全是 0.00。** 这是本文件里
+最严重的 bug：不是因为它大，而是因为它产出了一个**完整的、可信的、完全虚假的**能力结论。每个
+harness 会追加一段静态 `GUIDANCE`——为字符串任务写的，对字符串任务是对的——里面说要靠写
+`answer.txt` 提交。而有状态环境任务评的是 `state.json`，所以哪怕解法完全正确也只会拿 0.0；而且
+那段话从不提 `envtool`，于是 agent 通向环境的唯一路径就是猜工具名。transcript 里正是如此：
+`update_inventory_item_by_id: command not found`、`cat /var/log/syslog`、
+`echo "set balance to closed"`。
+
+Harbor 导出路径没有这个 bug，因为 `_instruction_md` 会渲染一张工具表。但那张表是在
+`harbor_export` 里生成的，永远到不了 harness 池——池读的是任务 **dict**，不是包——于是两条路径
+分岔了，而且**只有其中一条被执行过**。修法是给任务加 `guidance` 覆盖，由
+`core._instruction` 优先于静态文本。
+
+**第一次修没修好，而且它被验证所依据的那个数字是往上涨的。** 那个覆盖把环境的命令渲染成了一张
+裸列表——`envtool list_tickets`、`envtool set_state <id> <value>`。这读起来就是一张**工具列表**，
+而 prompt 里本来就有一张：chat template 会在指令上方把 harness 自己的工具渲染成 schema 块。面对
+两份同形状的列表，模型把它们合并了，把 `envtool list_tickets` **当成工具名**去调：
+
+```
+envtool list_tickets({'query': 'state=open'})
+-> Tool envtool list_tickets not found. Available: ['bash']
+```
+
+实测：全部 96 个 rollout 里 **70%** 是这一种形状，而且模型在根本没有该命令的环境上凭空造出了
+`list_accounts`、`list_items`——它在回答 prompt 的**形状**，不是它的内容。与此同时工具调用率从
+35.4% 升到 **81.2%**，通过率仍旧恰好 `0.00`，因为**调用一个不存在的工具也算工具调用**。那个本该
+检测「模型能否起码进入循环」的门，被它本该抓住的失败模式本身满足了。**一个错误调用就能通过的门
+不是门。**
+
+现在的 guidance 把命令介绍为**shell 命令行**，点名了通向它们的那个 shell 工具，并把错误形状明确
+标为错误。`scripts/env_scan_report.py` 会对每次调用分类形状（`no_call` / `bad_args` /
+`unknown_tool` / `query_only` / `wrong_target` / `mutated_ok`），于是调用率再也不能单独被读成进展
+——这正是当初发现它的方式。一矩阵的零，在「模型从没调用工具」「调用了一个不存在的工具」「调对了
+工具然后停下」三种情况下长得一模一样。
+
+**一个审计全绿却跑不起来的包。** `audit_package` 检查了 `environment/assets/tools.py` 存在、
+格式正确、列出了正确的工具——全都为真。它没检查工具是否**可被派发**，而有两个不可：`restore`
+和 `pin` 在进程内评分器（`envtask.apply_trace`）里实现了，导出程序里却缺失，于是导出的环境与
+驱动它的解法已经漂移。实测：**30 个包 0 个能执行**，每一个都报 `unknown tool: restore`。而测试
+套件全程是绿的，因为结构审计和分数比较在它们描述的东西已经坏掉时都照样成功。是本地执行器抓到的。
+教训是这个仓库反复学到的那条：**没被执行过的包只是一个主张，不是 benchmark。**
+
+**难度旋钮说了三次谎，三种不同的方式。** `n_steps` 是环境轴唯一的难度旋钮，每修一层就露出下一
+层：（1）链路被**查询**填充，查询不贡献参考步骤也不贡献检查点，于是 4 步链路评的是 1 步解法；
+（2）链路被参考**拒绝使用**的工具填充（`reset_log`、`bulk_update`），43% 的任务有 4 步链路而
+参考只有 1 步；（3）上限本身随一次未记录的抽样而变，`n_steps=5` 在 60 个种子里有 27 个被以
+"3 个可用变异器"拒绝、33 个以"4 个"拒绝——旋钮的**合法性**取决于种子。现在阶梯在每个设定下
+60/60 确定，超过上限 60/60 拒绝。
+
+**任务 dict 里的一个 callable 让批次写不出来。** `env_adapter` 在 `env` 键里放了个 `lambda`
+来把每个 rollout 指向自己的状态文件——意图正确，但它让 `json.dumps` 抛错，于是环境批次根本写不
+出来，跨 harness 差距就只能永远在字符串任务上测。修法是 `reset` 时解析的声明式模板。而**危险**
+的修法是把那个键丢掉：没有 `ENVTOOL_STATE`，每个 rollout 都会读同一个默认路径，所有 rollout
+静默共享一个状态文件——一个看起来能跑、实则让所有 rollout 互相耦合的环境。
 
 **一个值 84 分钟空转 GPU 的 subprocess 死锁。** shell runner 用了
 `subprocess.run(capture_output=True, timeout=...)`。超时触发时它只杀掉直接子进程，然后去
