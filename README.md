@@ -152,8 +152,10 @@ works occasionally, which is exactly the mistake the statistics layer exists to
 correct.
 
 The result is a JSONL ledger that is a test of each hypothesis rather than a
-score: 30 edits attempted, 10 accepted, and `context_mgmt` pruned for zero yield
-across every attempt.
+score: under replayed scoring, 30 edits attempted, 10 accepted, and
+`context_mgmt` pruned for zero yield across every attempt. (The measured run
+below prunes a different set and keeps a different component, which is the
+point of running it — see the comparison table.)
 
 **Those numbers come from `--score ledger-replay`, and the artifact says so.**
 `scripts/rsi_loop.py` has two scoring modes and the distinction is recorded under
@@ -202,8 +204,35 @@ The measured baseline is also the honest context for the ablation: ~0.03 is what
 an untrained 0.5B model scores when scored by this harness pool on generated
 tasks, which is consistent with the 0.1406 the shipped suite gives it on the
 train harnesses — generated tasks are harder, as gate V4 intends them to be.
-The full measured evolution is still running; when it lands, `outputs_rollout/`
-carries `score_mode: rollout` and fig10 is drawn from that ledger instead.
+
+**And the measured run does not reproduce the replayed one — it inverts it.**
+Over the same 30 tasks × 8 rollouts, `--score rollout` attempted **24** edits and
+accepted **1** (4%), against the replayed run's 30 attempted / 10 accepted:
+
+| | replayed (`outputs/`) | measured (`outputs_rollout/`) |
+| --- | --- | --- |
+| edits attempted | 30 | 24 |
+| edits accepted | 10 | 1 |
+| accept rate | 33% | **4%** |
+| noise floor | `0.05` (fixed fallback) | **`0.0176`** (bootstrapped) |
+| pruned for zero yield | `context_mgmt` | `prompt`, `output_plumbing` |
+| trajectory | `[0.471, 0.528, 0.528, …]` | `[0.0917, 0.0917, 0.0917]` |
+
+The one accepted edit is `context_mgmt+=keep_last_error` on `react_tools`,
+scoring `0.0542 → 0.0917` (`d=+0.0375`) — **the exact component the replayed run
+pruned for zero yield.** Its yield per component comes out
+`context_mgmt 0.25`, everything else `0.0`, so on real rollouts the component the
+stand-in discarded is the only one that ever cleared the floor. Of the 23
+rejections, 16 were `rejected_worse` and 7 `rejected_within_noise` — a
+distinction the replayed mode could not make, because its floor was a constant
+rather than a measurement.
+
+Two caveats belong beside that table rather than in a footnote. The trajectory is
+**flat**, not rising: one accepted edit that was never built on, so this is
+evidence the search *works* on real scores, not evidence it *helped*. And the
+measured run is 3 rounds against the replayed run's 6, so the attempt counts are
+not like-for-like — the accept *rate* is the comparable quantity, and it fell by
+roughly 8×.
 
 ## The gates, and why there are four
 
@@ -435,7 +464,10 @@ governs.**
 The ledger figure is drawn from whichever scoring mode has a ledger on disk, and
 its title names the mode. That labelling is load-bearing: a replayed trajectory
 and a measured one are both "a rising line", and only one of them means the
-harness improved.
+harness improved. Both ledgers now exist, so fig10 draws the **measured** one —
+`outputs_rollout/rsi/ledger.jsonl`, titled `score mode: rollout (measured)` —
+and the replayed ledger is what it falls back to when the rollout arm has not
+been run.
 
 **The self-construction axes: gate outcomes on a generated batch, and the
 training curve with zero-gradient steps marked.**

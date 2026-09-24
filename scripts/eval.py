@@ -47,6 +47,7 @@ import torch
 from multiharness._bootstrap import outputs_root
 from multiharness.harnesses import ALL_HARNESSES, HELDOUT_HARNESSES, TRAIN_HARNESSES
 from multiharness.rollout import Agent
+from multiharness.rsi import stats as rsi_stats
 from multiharness.tasks import load as load_tasks
 from multiharness.tasks.suite import EVAL_TASK_IDS, TRAIN_TASK_IDS
 
@@ -206,12 +207,70 @@ def main() -> int:
 
             # The headline claim of the experiment, stated as a test rather
             # than left for the reader to eyeball.
+            #
+            # The test is only meaningful if the held-out term can move. When it
+            # is pinned at 0 for every arm -- which is what `codex_style` did,
+            # 0/32 in baseline, single and multi alike -- then
+            # `gap == mean(train)` is an *identity*, and comparing gaps is
+            # comparing train means under another name. `min(gaps)` would then
+            # pick the arm that improved *least* and print it as "hypothesis
+            # supported", while the per-arm verdict above calls the same arm
+            # "overfitting the train harnesses". Both cannot be the headline.
+            #
+            # So the interval decides: if the held-out term's upper bound does
+            # not clear 0, there is no measurement to rank, and the honest
+            # output is that plus the sample size it would take.
             trained = [n for n in order if n != "baseline"]
-            if len(trained) >= 2:
+            held_passes = 0
+            held_n = 0
+            for name in order:
+                counts = results[name].get("counts", {})
+                for h in results[name]["heldout_harnesses"]:
+                    for _tid, k in counts.get(h, {}).items():
+                        held_n += results[name]["n_per_cell"]
+                        held_passes += int(k)
+
+            # The identity condition is exact, not statistical: `gap` is defined
+            # as `mean_train - mean_heldout`, so if every arm's held-out mean is
+            # 0.0 then `gap == mean_train` holds as an equality, and no interval
+            # is needed to know that ranking gaps ranks train means.
+            pinned = held_n > 0 and all(
+                results[n]["mean_heldout_harness"] == 0.0 for n in order
+            )
+
+            if len(trained) >= 2 and pinned:
+                cell = rsi_stats.classify_cell(
+                    held_passes, held_n,
+                    harness="|".join(results[order[0]]["heldout_harnesses"]),
+                    task_id="(pooled over arms)",
+                )
+                print(f"\n  held-out term : {held_passes}/{held_n} passes pooled over "
+                      f"{len(order)} arms")
+                print(f"                  95% CI [{cell.lo:.4f}, {cell.hi:.4f}]  ({cell.verdict})")
+                print("  >>> INCONCLUSIVE for the headline claim: the held-out mean is exactly")
+                print("      0.0 in every arm, so gap == mean(train harnesses) is an identity and")
+                print("      ranking gaps ranks train means. Neither 'supported' nor 'not")
+                print("      supported' follows. The per-arm verdicts above still stand on")
+                print("      their own, because they describe the train term.")
+                if cell.hi <= rsi_stats.SIGNAL_LO:
+                    print("      This is a *positive* finding, not a call for more data: the")
+                    print(f"      upper bound is below the {rsi_stats.SIGNAL_LO:.2f} signal floor, so the")
+                    print("      held-out harness is provably outside the learnable band.")
+                else:
+                    print("      The interval is too wide to call this DEAD, which at 0 passes")
+                    print(f"      needs n >= {rsi_stats.rollouts_for_dead()} per cell; this run used")
+                    print(f"      {results[order[0]]['n_per_cell']}.")
+                print("      scripts/harness_solvability.py shows the reference solution reaching")
+                print("      1.0 on 24/24 tasks through this harness, so the floor is the policy's,")
+                print("      not the harness's. Reporting this gap as a measured generalization")
+                print("      number would be reporting 0 == 0.")
+            elif len(trained) >= 2:
                 gaps = {n: results[n]["gap"] for n in trained}
                 best = min(gaps, key=gaps.get)
                 worst = max(gaps, key=gaps.get)
-                print(f"\n  smallest gap: {best} ({gaps[best]:+.4f})")
+                print(f"\n  held-out term : {held_passes}/{held_n} passes pooled over "
+                      f"{len(order)} arms")
+                print(f"  smallest gap: {best} ({gaps[best]:+.4f})")
                 print(f"  largest  gap: {worst} ({gaps[worst]:+.4f})")
                 if "multi" in best and "single" in worst:
                     print("  >>> multi-harness training produced the smaller gap — hypothesis supported")

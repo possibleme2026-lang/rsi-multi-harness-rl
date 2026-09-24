@@ -84,6 +84,10 @@ __all__ = [
     "noise_floor",
     "classify_cell",
     "summarise_cells",
+    "power_two_proportion",
+    "minimum_detectable_effect",
+    "rollouts_for_effect",
+    "rollouts_for_dead",
 ]
 
 #: Below this pass rate a cell contributes almost nothing to a group.
@@ -462,6 +466,36 @@ def rollouts_for_effect(
     n = 2
     while n < cap:
         if power_two_proportion(d, n, p_bar, alpha=alpha) >= power:
+            return n
+        n += 1
+    return cap
+
+
+def rollouts_for_dead(
+    passes: int = 0,
+    *,
+    lo_threshold: float = SIGNAL_LO,
+    confidence: float = 0.95,
+    cap: int = 100_000,
+) -> int:
+    """Smallest ``n`` at which a cell with ``passes`` observed is callable DEAD.
+
+    The inverse of the boundary that :func:`classify_cell` documents: at zero
+    passes the Wilson upper bound falls below ``SIGNAL_LO`` at ``n = 73``, and
+    with one pass at ``n = 110``.
+
+    This exists because those two numbers were prose in a docstring and
+    therefore unverifiable from outside the module -- and prose is where the
+    wrong ``n >= 128`` lived for a while. A caller that wants to say "this
+    needs more data before it can be called dead" should be able to ask for the
+    number rather than restate it, because a restated constant is a constant
+    that drifts.
+    """
+    if passes < 0:
+        raise ValueError("passes cannot be negative")
+    n = max(passes, 1)
+    while n < cap:
+        if wilson_interval(passes, n, confidence)[1] < lo_threshold:
             return n
         n += 1
     return cap

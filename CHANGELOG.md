@@ -460,9 +460,20 @@ before it.
   `0.25` for every harness against measured baselines of `0.008 / 0.054 /
   0.029 / 0.029`, and a floor of `0.05` against a bootstrapped `0.0176`. So the
   replayed run started ~8× too high and demanded a ~3× too large margin. The
-  measured arm is still running; until it completes, the honest statement is that
-  the harness search *works*, not that it *helped* — and the previously reported
-  replayed trajectory of `0.471 → 0.528` describes the stand-in function rather
-  than a harness.
+  measured arm has now completed, and it **inverts** the replayed one: 24 edits
+  attempted, **1** accepted (4%), against the replayed 30/10. The single accepted
+  edit is `context_mgmt+=keep_last_error` on `react_tools`, scoring
+  `0.0542 → 0.0917` (`d=+0.0375`) — the exact component the replayed run pruned
+  for zero yield — and its yield per component is `context_mgmt 0.25` with
+  everything else `0.0`. The prune set is `prompt` + `output_plumbing`, not
+  `context_mgmt`. Of the 23 rejections, 16 were `rejected_worse` and 7
+  `rejected_within_noise`, a distinction the replayed mode cannot make because
+  its floor was a constant. The honest statement remains that the harness search
+  *works* on real scores, not that it *helped*: the trajectory is flat
+  (`[0.0917, 0.0917, 0.0917]`), one accepted edit that was never built on, and
+  the run was 3 rounds against the replayed run's 6 — so the comparable quantity
+  is the accept *rate*, which fell ~8×. The previously reported replayed
+  trajectory of `0.471 → 0.528` describes the stand-in function rather than a
+  harness.
 
 [Unreleased]: https://github.com/possibleme2026-lang/rsi-multi-harness-rl/commits/main

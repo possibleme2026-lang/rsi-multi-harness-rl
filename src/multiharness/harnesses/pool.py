@@ -272,10 +272,27 @@ class CodexStyleEnv(BaseHarnessEnv):
         # A heredoc ends at its terminator, so the `||` landed on a line of its
         # own and the whole command was a bash *syntax error* — the patch was
         # never applied, and the model's perfectly valid unified diff came back
-        # as `syntax error near unexpected token '||'`. This is a harness defect
-        # that reads as a model failure: it is why `codex_style` scored 0/8 on
-        # every eval task in every arm. An error message that blames the tool
-        # while the tool was never invoked is worse than no fallback.
+        # as `syntax error near unexpected token '||'`. An error message that
+        # blames the tool while the tool was never invoked is worse than no
+        # fallback.
+        #
+        # This bug is real, but it was **not** why `codex_style` scores 0 on
+        # every eval task, and an earlier version of this comment said it was.
+        # Measured: `eval_ablation.json` and `eval_ablation_pre_harness_fix.json`
+        # are byte-identical (md5 38f7a0dacbeb9eef8e74480608bd7dc1), so the fix
+        # moved nothing. The real cause is upstream of this method: the model
+        # never calls it. Transcripts from `scripts/diag.py --harness
+        # codex_style` show 0 tool calls — the budget goes to planning prose
+        # (which this harness's own "Plan first, then act" guidance invites) or
+        # to a JSON tool call written inside a markdown fence, which the parser
+        # does not accept. And `scripts/harness_solvability.py` shows the
+        # reference solution reaching 1.0 on 24/24 tasks through `apply_patch`,
+        # so the harness is capable; the policy is not.
+        #
+        # The lesson worth keeping: a defect that is genuinely in the code still
+        # has to be *attributed* by measurement. A plausible cause near the
+        # symptom is not a cause, and the fix that "should" have worked was
+        # never checked against the artifact it was supposed to move.
         #
         # `{ ... }` groups the heredoc-fed command so a single `||` can follow
         # it legally, and the exit status is reported rather than parsed out of

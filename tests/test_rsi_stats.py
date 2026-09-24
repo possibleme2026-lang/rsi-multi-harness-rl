@@ -65,6 +65,7 @@ from multiharness.rsi.stats import (  # noqa: E402
     minimum_detectable_effect,
     noise_floor,
     power_two_proportion,
+    rollouts_for_dead,
     rollouts_for_effect,
     rule_of_three_upper,
     summarise_cells,
@@ -405,6 +406,49 @@ def main() -> int:
         power_two_proportion(0.10, 128, p_bar) > power_two_proportion(0.0391, 128, p_bar),
     )
     check("a degenerate rate has no defined MDE", math.isnan(minimum_detectable_effect(128, 0.0)))
+
+    # ------------------------------------------------------------------
+    # The DEAD boundary, asked for rather than restated.
+    #
+    # `classify_cell`'s docstring says zero passes needs n >= 73 and one pass
+    # needs n >= 110. Those were prose for a while, and prose is where the
+    # wrong "roughly n >= 128" lived. `rollouts_for_dead` exists so the number
+    # can be asked for; these assertions keep it equal to the boundary the
+    # verdict function actually applies, so the two cannot drift apart.
+    # ------------------------------------------------------------------
+    print("\n-- rollouts_for_dead: the boundary, computed rather than quoted --")
+    check("zero passes needs n >= 73", rollouts_for_dead(0) == 73, str(rollouts_for_dead(0)))
+    check("one pass needs n >= 110", rollouts_for_dead(1) == 110, str(rollouts_for_dead(1)))
+    check(
+        "n=73 is the first zero-pass cell the verdict calls DEAD",
+        classify_cell(0, 73).verdict is CellVerdict.DEAD
+        and classify_cell(0, 72).verdict is not CellVerdict.DEAD,
+    )
+    check(
+        "the helper agrees with classify_cell at its own boundary",
+        rollouts_for_dead(0) == 73 and wilson_interval(0, 73)[1] < SIGNAL_LO,
+        f"wilson(0,73) hi={wilson_interval(0, 73)[1]:.5f}",
+    )
+    check(
+        "the boundary is monotone in the observed passes",
+        rollouts_for_dead(0) < rollouts_for_dead(1) < rollouts_for_dead(2),
+    )
+    try:
+        rollouts_for_dead(-1)
+        _neg_rejected = False
+    except ValueError:
+        _neg_rejected = True
+    check("a negative pass count is rejected", _neg_rejected)
+
+    # The held-out term of the shipped ablation, pooled over its three arms:
+    # 0/96. This is the number that makes `gap == mean(train)` an identity, and
+    # it is DEAD rather than merely under-measured -- a positive finding that
+    # the harness sits outside the learnable band, not a call for more data.
+    print("\n-- the shipped held-out term: 0/96 pooled is DEAD, not 'needs more data' --")
+    _held = classify_cell(0, 96, harness="codex_style", task_id="(pooled over arms)")
+    check("0/96 pools to a DEAD verdict", _held.verdict is CellVerdict.DEAD, _held.verdict)
+    check("0/96 upper bound clears the floor", _held.hi < SIGNAL_LO, f"{_held.hi:.4f}")
+    check("0/96 upper bound is 0.0385", abs(_held.hi - 0.0385) < 5e-5, f"{_held.hi:.4f}")
 
     # ------------------------------------------------------------------
     print("\n" + "=" * 74)
