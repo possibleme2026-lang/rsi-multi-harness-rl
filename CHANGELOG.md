@@ -228,8 +228,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `0.0000` in all three. Training beats the baseline on the harnesses it sees
   (`z = +2.49` and `+3.15` — real), and multi beats single by `d = +0.0391`,
   `z = +0.69` — the predicted direction, indistinguishable from zero. At
-  `n = 128` per arm the minimum detectable effect is `0.1572`; 80% power at the
-  observed effect needs ~2,096 rollouts per arm, 16× this run. The pre-registered
+  `n = 128` per arm the minimum detectable effect is `0.1581`; 80% power at the
+  observed effect needs ~2,094 rollouts per arm, 16× this run. The pre-registered
   hypothesis is **not supported and not refuted**.
 - **The held-out axis is a floor effect, so the gap metric could not be tested.**
   `codex_style` scores 0/32 on the *untrained baseline*, so the held-out term is

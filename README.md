@@ -490,8 +490,8 @@ Wilson intervals on the train means make the resolution explicit:
 baseline `[0.0908, 0.2114]`, single `[0.1968, 0.3482]`, multi `[0.2316, 0.3892]`.
 Single and multi overlap across most of their range. Two numbers say how far off
 the design was: at `n = 128` rollouts per arm the **minimum detectable effect** is
-`d ≥ 0.1572`, and the observed effect is `0.0391` — a quarter of that. Reaching
-80% power at the observed effect size needs **~2,096 rollouts per arm, 16×** the
+`d ≥ 0.1581`, and the observed effect is `0.0391` — a quarter of that. Reaching
+80% power at the observed effect size needs **~2,094 rollouts per arm, 16×** the
 eval that was run, which is not a laptop-sized experiment on this GPU. That is a
 budget statement, not an excuse: the number is what it is, and the direction is
 all this run can honestly report.
@@ -536,7 +536,7 @@ Three ways forward, in order of how much they would settle:
 
 1. **Replace the held-out harness** with one the baseline can drive, so
    `gap = train − held_out` has a live second term. Cheap; unblocks the protocol.
-2. **Power the train contrast** (~2,096 rollouts/arm) if the question is the
+2. **Power the train contrast** (~2,094 rollouts/arm) if the question is the
    0.0391 itself rather than the gap.
 3. **Regenerate the suite** so frontier cells sit on the frontier — the task
    generator's job, per the T2 finding above.

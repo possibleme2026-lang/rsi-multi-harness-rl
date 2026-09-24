@@ -31,12 +31,13 @@ some signal.
 
 The second half of the problem is measurement error. A cell's pass rate is
 estimated from ``n`` rollouts, and an observed ``0/8`` has a 95% upper
-confidence bound of **0.375**. A cell whose true rate is 0.30 shows ``0/8``
-about 5.8% of the time, so "we measured zero" is not evidence that the cell is
-dead — it is evidence that we measured too little. The old two-way split
-(keep / drop) silently converted that ambiguity into "drop", which biases the
-training set towards tasks the model already finds easy and makes the suite
-look easier than it is.
+confidence bound of **0.312** (exact; the familiar ``3/n`` gives 0.375 and is a
+large-``n`` approximation — see :func:`rule_of_three_upper`). A cell whose true
+rate is 0.30 shows ``0/8`` about 5.8% of the time, so "we measured zero" is not
+evidence that the cell is dead — it is evidence that we measured too little.
+The old two-way split (keep / drop) silently converted that ambiguity into
+"drop", which biases the training set towards tasks the model already finds
+easy and makes the suite look easier than it is.
 
 What replaces it
 ----------------
@@ -385,6 +386,85 @@ def classify_cell(
         signal_prob=signal_prob,
         needs_more_data=needs_more,
     )
+
+
+def _phi(x: float) -> float:
+    """Standard normal CDF."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def power_two_proportion(d: float, n: int, p_bar: float, *, alpha: float = 0.05) -> float:
+    """Power of an unpaired two-proportion test at effect ``d`` and ``n``/arm.
+
+    ``p_bar`` is the pooled rate the test assumes under the null. This is the
+    normal approximation used throughout the README's power statements, and it
+    is deliberately the *unpaired* form: the ablation's arms are separate runs,
+    so pairing them would overstate the power of the comparison that was
+    actually made.
+    """
+    if n <= 0 or not 0.0 < p_bar < 1.0:
+        return 0.0
+    z_a = _z_for(1.0 - alpha)
+    se = math.sqrt(2.0 * p_bar * (1.0 - p_bar) / n)
+    if se == 0.0:
+        return 1.0
+    return _phi(d / se - z_a)
+
+
+def minimum_detectable_effect(
+    n: int,
+    p_bar: float,
+    *,
+    power: float = 0.80,
+    alpha: float = 0.05,
+) -> float:
+    """Smallest ``d`` an ``n``-per-arm two-proportion test detects at ``power``.
+
+    This is the number that decides whether a null result is a finding or an
+    admission. The README reports an observed effect of ``0.0391`` against an
+    MDE of ``0.1572`` at ``n = 128``/arm; without the MDE, "no difference
+    detected" reads as "no difference", when it in fact means the design could
+    not have seen a difference that small.
+
+    Solved by bisection on :func:`power_two_proportion` rather than by the
+    closed form ``(z_a + z_b)·sqrt(2·p̄·(1−p̄)/n)``, so that the number quoted
+    is the one the power function actually attains. The two agree to three
+    decimals at these sample sizes, but the closed form is a large-``n``
+    approximation and this module already has one of those causing trouble.
+    """
+    if n <= 0 or not 0.0 < p_bar < 1.0:
+        return float("nan")
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if power_two_proportion(mid, n, p_bar, alpha=alpha) < power:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def rollouts_for_effect(
+    d: float,
+    p_bar: float,
+    *,
+    power: float = 0.80,
+    alpha: float = 0.05,
+    cap: int = 1_000_000,
+) -> int:
+    """Rollouts per arm needed to detect ``d`` at ``power``.
+
+    The inverse of :func:`minimum_detectable_effect`, and the source of the
+    README's "~2,096 rollouts per arm, 16× the eval that was run".
+    """
+    if d <= 0.0 or not 0.0 < p_bar < 1.0:
+        return cap
+    n = 2
+    while n < cap:
+        if power_two_proportion(d, n, p_bar, alpha=alpha) >= power:
+            return n
+        n += 1
+    return cap
 
 
 def summarise_cells(cells: list[CellStats]) -> dict:

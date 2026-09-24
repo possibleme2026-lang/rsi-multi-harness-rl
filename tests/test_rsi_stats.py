@@ -62,7 +62,10 @@ from multiharness.rsi.stats import (  # noqa: E402
     classify_cell,
     grpo_dead_probability,
     grpo_signal_probability,
+    minimum_detectable_effect,
     noise_floor,
+    power_two_proportion,
+    rollouts_for_effect,
     rule_of_three_upper,
     summarise_cells,
     wilson_interval,
@@ -351,6 +354,57 @@ def main() -> int:
     # A cleaner cell has a smaller floor.
     clean = [[1.0] * 16 for _ in range(4)]
     check("a deterministic cell has a zero floor", close(noise_floor(clean), 0.0, 1e-12))
+
+    # ------------------------------------------------------------------
+    print("\npower — the numbers that decide whether a null is a finding")
+    # ------------------------------------------------------------------
+    # These are quoted in the README and the CHANGELOG as the reason the
+    # ablation settles nothing: an MDE far larger than the observed effect.
+    # Nothing computed them until now, so the published pair could not be
+    # checked against code at all. Pinned against the measured ablation, with
+    # p_bar pooled over the two arms being compared (single, multi).
+    p_bar = (34 / 128 + 39 / 128) / 2
+    check(
+        "the ablation's pooled rate is what the docs assume",
+        close(p_bar, 0.285156, 1e-6),
+        f"{p_bar}",
+    )
+    mde = minimum_detectable_effect(128, p_bar)
+    check(
+        "MDE at n=128/arm is 0.1581, as the README states",
+        close(mde, 0.1581, 5e-5),
+        f"{mde:.6f} — the README previously said 0.1572, which no definition produced",
+    )
+    check(
+        "the observed effect is about a quarter of the MDE",
+        close(0.0391 / mde, 0.247, 0.005),
+        f"{0.0391 / mde:.4f}",
+    )
+    check(
+        "the run had ~10% power, which is why it could not settle the question",
+        close(power_two_proportion(0.0391, 128, p_bar), 0.103, 0.005),
+        f"{power_two_proportion(0.0391, 128, p_bar):.4f}",
+    )
+    need = rollouts_for_effect(0.0391, p_bar)
+    check(
+        "80% power at the observed effect needs ~2,094 rollouts/arm, 16x the run",
+        abs(need - 2094) <= 3,
+        f"{need} per arm = {need / 128:.1f}x",
+    )
+    # The closed form and the bisection must agree, or one of them is wrong.
+    closed = 1.959963985 + 0.8416212336
+    closed *= math.sqrt(2.0 * p_bar * (1.0 - p_bar) / 128)
+    check(
+        "bisection agrees with the closed form at this sample size",
+        close(mde, closed, 5e-4),
+        f"bisection {mde:.6f} vs closed form {closed:.6f}",
+    )
+    check("power rises with n", power_two_proportion(0.0391, 512, p_bar) > power_two_proportion(0.0391, 128, p_bar))
+    check(
+        "power rises with the effect",
+        power_two_proportion(0.10, 128, p_bar) > power_two_proportion(0.0391, 128, p_bar),
+    )
+    check("a degenerate rate has no defined MDE", math.isnan(minimum_detectable_effect(128, 0.0)))
 
     # ------------------------------------------------------------------
     print("\n" + "=" * 74)
