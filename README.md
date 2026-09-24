@@ -274,8 +274,16 @@ number.
 | G3 cross-harness spread | > 0 | **0.72** | pass |
 | G4 multi-turn uptake | ≥ 50% | **100%** of 1,584 tool-calling rollouts | pass |
 
-**Go/No-Go: GO.** Qwen2.5-0.5B-Instruct can drive all five harnesses. Mean turns
-1.78, mean tool calls 1.04.
+**Go/No-Go: GO.** Qwen2.5-0.5B-Instruct can drive the four trainable harnesses.
+Mean turns 1.78, mean tool calls 1.04.
+
+The probe covers the trainable pool only — `scripts/probe.py` resolves names
+through `TRAIN_HARNESSES`, so `codex_style` is not reachable from it. That is
+deliberate rather than an oversight: the held-out harness is the measurement's
+dependent variable, and a capability gate that tuned itself against it would
+spend the thing being measured. It does mean this gate says nothing about
+`codex_style`, and the eval later showed it scores `0/32` there — so "GO" is a
+statement about the four harnesses training can see, not about all five.
 
 ## What the measurement actually found
 
