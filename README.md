@@ -399,6 +399,11 @@ ledger.**
 
 ![harness evolution ledger](docs/figures/fig10_ledger.png)
 
+The ledger figure is drawn from whichever scoring mode has a ledger on disk, and
+its title names the mode. That labelling is load-bearing: a replayed trajectory
+and a measured one are both "a rising line", and only one of them means the
+harness improved.
+
 **The self-construction axes: gate outcomes on a generated batch, and the
 training curve with zero-gradient steps marked.**
 
