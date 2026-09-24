@@ -714,9 +714,47 @@ def main() -> int:
                     help="tool-chain length, i.e. the depth of the dependency path")
     ap.add_argument("--env-export", action="store_true",
                     help="write Harbor task packages under outputs/rsi/harbor")
+    ap.add_argument("--batch-only", action="store_true",
+                    help="write rsi/batch.json and rsi/env_batch.json, then stop. Exists so "
+                         "the batch can be scanned *before* the curriculum reads a scan: "
+                         "steering needs a scan of the batch it is steering, and the batch "
+                         "must therefore exist first. Generation is deterministic in --seed, "
+                         "so the later full run reproduces this exact batch.")
     args = ap.parse_args()
 
     OUT.mkdir(parents=True, exist_ok=True)
+
+    if args.batch_only:
+        # The two-file dance this replaces was a comment in pipeline.sh telling
+        # the reader to run `probe.py --from-batch` and then re-run the whole
+        # pipeline with CURRICULUM_SCAN set. Nobody did, so the curriculum read
+        # a scan of the shipped suite, found no shared ids, and reported zero
+        # moves on every run. A closed loop that has to be assembled by hand is
+        # an open loop.
+        OUT.mkdir(parents=True, exist_ok=True)
+        string_batch = task_gen.generate_batch(args.task_batch, seed=args.seed)
+        (OUT / "batch.json").write_text(json.dumps(string_batch, indent=2), encoding="utf-8")
+        print(f"wrote {OUT / 'batch.json'}  ({len(string_batch)} tasks)")
+
+        if args.env_batch > 0:
+            env_tasks = envtask.generate_env_batch(
+                args.env_batch,
+                seed=args.seed,
+                n_records=args.env_records,
+                n_distractors=args.env_distractors,
+                n_steps=args.env_steps,
+            )
+            env_batch = env_adapter.as_harness_batch(env_tasks)
+            (OUT / "env_batch.json").write_text(
+                json.dumps(env_batch, indent=2), encoding="utf-8"
+            )
+            print(f"wrote {OUT / 'env_batch.json'}  ({len(env_batch)} environment tasks)")
+
+        print("\nnow scan them before steering on them:")
+        print(f"  ./run.sh scripts/probe.py --from-batch {OUT / 'batch.json'} \\")
+        print(f"      --n <n> --out {OUT / 'scan_batch.json'}")
+        return 0
+
     # Start each run from an empty ledger. Appending to a previous run's ledger
     # would make `tried()` claim edits were attempted when they were attempted
     # in a different experiment, and the yield statistics would be a mixture.

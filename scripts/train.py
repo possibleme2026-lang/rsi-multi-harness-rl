@@ -43,11 +43,42 @@ from multiharness.harnesses import (
     HELDOUT_HARNESSES,
     TRAIN_HARNESSES,
 )
+from multiharness.harnesses.core import TASKS, register_tasks
 from multiharness.rsi import stats as rsi_stats
 from multiharness.tasks import load as load_tasks
 from multiharness.tasks.suite import TRAIN_TASK_IDS
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+def load_generated_batch(path: Path) -> list[str]:
+    """Register a generated batch and return its task ids.
+
+    This is the other half of the RSI loop. `rsi_loop.py` writes
+    ``rsi/batch.json`` (string tasks) and ``rsi/env_batch.json`` (environment
+    tasks, already in harness-pool shape), but until this function existed
+    nothing under ``train.py`` could read either of them: the row builder was
+    hardcoded to ``TRAIN_TASK_IDS``. So the pipeline generated tasks, scanned
+    them, steered a curriculum over them — and then trained on the shipped
+    suite anyway. Every artifact said "generated", and the gradient came from
+    sixteen frozen ids.
+
+    Registering is not optional. `Agent.run` resolves task ids through the
+    process-global registry in ``harnesses/core.py``, so a row naming
+    ``t4-c1ff0a35`` raises ``KeyError`` at rollout time unless the batch has
+    been installed first. `probe.py --from-batch`` does exactly this and it is
+    the reason a generated batch is scannable at all.
+    """
+    batch = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(batch, list) or not batch:
+        raise ValueError(f"{path}: expected a non-empty JSON list of task dicts")
+    missing = [i for i, t in enumerate(batch) if not isinstance(t, dict) or "id" not in t]
+    if missing:
+        raise ValueError(f"{path}: entries {missing[:5]} have no 'id' field")
+
+    fresh = [t for t in batch if t["id"] not in TASKS]
+    register_tasks(fresh)
+    return [t["id"] for t in batch]
 
 
 def build_dataset(
@@ -165,9 +196,52 @@ def main() -> int:
                     help="probe.json from a difficulty scan; enables the signal filter")
     ap.add_argument("--no-filter", action="store_true",
                     help="train on every row, including provably dead ones")
+    ap.add_argument("--batch", default=None,
+                    help="generated batch (rsi/batch.json or rsi/env_batch.json) to train "
+                         "on instead of the shipped suite; closes the RSI loop")
+    ap.add_argument("--require-signal", action="store_true",
+                    help="refuse to train when the scan and the batch share no task ids, "
+                         "which is the state in which the curriculum is silently inert")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="stop after building the dataset and print what would be trained; "
+                         "checks the wiring without loading a model or touching the GPU")
     args = ap.parse_args()
 
     load_tasks()
+
+    # -- which tasks? -----------------------------------------------------
+    # Default stays the shipped suite so existing arms reproduce byte-for-byte.
+    # `--batch` switches to a generated one, which is the only way the tasks the
+    # RSI axis produced can reach the gradient at all.
+    if args.batch:
+        train_task_ids = load_generated_batch(Path(args.batch))
+        print(f"batch source       : {args.batch}  ({len(train_task_ids)} generated tasks)")
+    else:
+        train_task_ids = list(TRAIN_TASK_IDS)
+
+    # A scan that shares no ids with the rows is worse than no scan: the filter
+    # finds no pass rate for any row, keeps everything, and reports "unmeasured"
+    # — so the run looks filtered while nothing was filtered, and the curriculum
+    # that was supposed to steer these tasks is inert. This is the exact state
+    # `pipeline.sh` lands in by default, and it is silent, which is why it needs
+    # an explicit flag rather than a warning.
+    if args.scan and args.require_signal:
+        scan_ids = {
+            str(r.get("task_id"))
+            for r in json.loads(Path(args.scan).read_text(encoding="utf-8")).get("records", [])
+        }
+        overlap = sorted(set(train_task_ids) & scan_ids)
+        if not overlap:
+            print(
+                f"\n!! --require-signal: {args.scan} measures {len(scan_ids)} task ids, "
+                f"none of which are among the {len(train_task_ids)} rows to train on.\n"
+                f"   The signal filter would keep every row unmeasured and the curriculum\n"
+                f"   has nothing to steer. Scan the batch you intend to train on:\n"
+                f"     ./run.sh scripts/probe.py --from-batch {args.batch} "
+                f"--n <n> --out <scan>\n"
+            )
+            return 1
+        print(f"scan overlap       : {len(overlap)}/{len(train_task_ids)} rows measured")
 
     # bash_minimal is the plainest scaffold, so the single-harness baseline is
     # not handicapped by a harness the model would struggle with anyway.
@@ -187,7 +261,7 @@ def main() -> int:
 
     # -- rows, then the signal filter -------------------------------------
     raw_rows = []
-    for k, tid in enumerate(TRAIN_TASK_IDS):
+    for k, tid in enumerate(train_task_ids):
         for j in range(len(harnesses)):
             h = list(harnesses)[(k + j) % len(harnesses)]
             raw_rows.append({"environment": h, "task_id": tid})
@@ -226,7 +300,7 @@ def main() -> int:
     print("=" * 78)
     print(f"TRAIN  mode={args.mode}  harnesses={list(harnesses)}")
     print("=" * 78)
-    print(f"dataset rows       : {len(dataset)} of {len(TRAIN_TASK_IDS) * len(harnesses)} possible")
+    print(f"dataset rows       : {len(dataset)} of {len(train_task_ids) * len(harnesses)} possible")
     if dead:
         by_h: dict[str, int] = {}
         for h, _ in dead:
@@ -244,6 +318,23 @@ def main() -> int:
     print(f"unique prompts/step: {per_step_unique}   completions/step: {args.per_device_batch}")
     print(f"steps              : {args.steps}   lr={args.lr}   lora_r={args.lora_r}")
     print(f"output             : {out_dir}")
+
+    if args.dry_run:
+        # Everything above this line is the part that decides *what* the run
+        # trains on, and all of it is checkable without a GPU. That matters
+        # because the interesting failures in this script are wiring failures:
+        # rows that name tasks the registry cannot resolve, or a scan whose ids
+        # match none of them, both of which used to surface only after the model
+        # had loaded.
+        seen = sorted({r["task_id"] for r in raw_rows})
+        print()
+        print("DRY RUN — stopping before the model loads.")
+        print(f"  tasks to train on  : {len(seen)}  {seen[:4]}{' ...' if len(seen) > 4 else ''}")
+        print(f"  distinct rows      : {len(dataset)}")
+        print(f"  source             : {args.batch or 'shipped suite (TRAIN_TASK_IDS)'}")
+        for h in harnesses:
+            print(f"  {h:<19}: {sum(1 for r in raw_rows if r['environment'] == h)} rows")
+        return 0
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     if tokenizer.pad_token is None:
@@ -321,7 +412,7 @@ def main() -> int:
     summary = {
         "mode": args.mode,
         "harnesses": list(harnesses),
-        "train_tasks": TRAIN_TASK_IDS,
+        "train_tasks": train_task_ids,
         "rows_used": len(raw_rows),
         "rows_dropped_dead": [[h, t] for h, t in dead],
         "rows_kept_under_measured": [[h, t] for h, t in thin],

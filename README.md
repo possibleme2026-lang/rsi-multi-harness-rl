@@ -469,6 +469,46 @@ all-pass cell has a Wilson lower bound of 0.8928, just below `MASTERED_ABOVE =
 0.9`, so it resolves to `unresolved` and produces no move however clear its point
 estimate looks. The scan that produced the table above is `n = 32`.
 
+**And a second correction, because the first one overclaimed.** The paragraph
+above said the curriculum "is wired up now". It was reachable; it was not
+*reached*. The wiring landed in `rsi/curriculum.py`, and the two bugs it exposed
+were fixed — but `pipeline.sh` still handed the curriculum `scan_all.json`, which
+measures the shipped 16 ids, while the batch being steered carried generated ids.
+The plan was therefore empty on every run, for the reason the code itself
+reported:
+
+```
+skipped: the scan measures 16 task ids, none of which are in the batch of 2;
+         no task can be steered
+```
+
+That message is correct and it is also the whole failure: the loop's ordering was
+wrong. A batch has to exist before it can be measured and measured before it can
+be steered, and the pipeline did the third thing without the first two. The
+manual two-command workaround was written into a comment (`probe.py --from-batch`,
+then re-run with `CURRICULUM_SCAN` set) and never executed, which is the same
+pattern as `steer` itself: documented, available, not run.
+
+The fix is ordering, and `tests/test_rsi_closed_loop.py` now pins it — generation
+before the scan, the scan of *that* batch, steering and training both reading it,
+and an id mismatch that is fatal instead of a silent zero-move plan.
+
+**The third instance of the same pattern was in the trainer.** `train.py` built
+its rows from a hardcoded `TRAIN_TASK_IDS`, so no generated task could reach the
+gradient even once a scan covered it. It now takes `--batch` (either
+`rsi/batch.json` or `rsi/env_batch.json`, which are different task shapes) and
+registers the batch into the process-global task registry that `Agent.run`
+resolves ids through. `--require-signal` refuses a scan that measures none of the
+rows, and `--dry-run` stops before the model loads so the wiring is checkable
+without a GPU.
+
+Why this matters for the training curve: the two 128-step arms trained on 64
+rows, which at 2 unique prompts per step is 16 epochs over sixteen frozen ids.
+The reward plateau past step 65 and the rise of `frac_reward_zero_std` to 0.66 are
+what memorisation looks like, not what a capability ceiling looks like. Generated
+tasks are the mechanism the repository already had for escaping that, and until
+now the gradient never saw one.
+
 ## Figures
 
 All thirteen are regenerated from recorded artifacts by `./run.sh tools/plot.py`,
@@ -671,6 +711,7 @@ cd rsi-multi-harness-rl
 ./run.sh tests/test_rsi_stats.py
 ./run.sh tests/test_rsi_generator.py
 ./run.sh tests/test_rsi_loop.py
+./run.sh tests/test_rsi_closed_loop.py
 ./run.sh tests/smoke_env.py
 ```
 
@@ -682,6 +723,24 @@ the four gates, and the harness evolution can all be exercised on CPU:
 ./run.sh tools/check_figures.py
 ./run.sh tools/check_readme_i18n.py
 ```
+
+The closed loop has a CPU-only path too, and it is the cheapest way to check the
+wiring after touching any of the four stages:
+
+```bash
+# 1. write the batch (deterministic in --seed)
+./run.sh scripts/rsi_loop.py --batch-only --task-batch 12 --env-batch 4 --seed 11
+# 2. measure it -- this is the step that closes the loop
+./run.sh scripts/probe.py --from-batch outputs/rsi/batch.json \
+    --n 32 --out outputs/rsi/scan_batch.json
+# 3. check what training would consume, without loading a model
+./run.sh scripts/train.py --mode multi --steps 1 \
+    --batch outputs/rsi/batch.json --scan outputs/rsi/scan_batch.json \
+    --require-signal --dry-run
+```
+
+`pipeline.sh` runs exactly this order by default. `TRAIN_ON_BATCH=0` restores the
+older behaviour of training on the shipped suite.
 
 `run.sh` is the supported entry point, not a convenience. It sets `APPDATA`, the
 HuggingFace cache, and clears `PYTHONPATH`, because on Windows each of those

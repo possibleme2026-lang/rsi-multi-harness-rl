@@ -373,6 +373,35 @@ dead 0、欠测量 11。
 `MASTERED_ABOVE = 0.9`，于是它判定为 `unresolved`，无论点估计看起来多清晰都不会产生任何移动。
 上面那张表所用的 scan 就是 `n = 32`。
 
+**以及第二处更正——因为第一处更正自己也说过头了。** 上面那段写着课程「现在它被接上了」。它是
+*可到达*了，但并没有被*到达*。接线确实落在了 `rsi/curriculum.py`，它暴露的两个 bug 也确实修了——
+但 `pipeline.sh` 仍然把 `scan_all.json` 交给课程，那份 scan 测的是随仓库发布的 16 个 id，而正在
+被转向的 batch 带的是生成出来的 id。于是每次运行的计划都是空的，理由由代码自己报了出来：
+
+```
+skipped: the scan measures 16 task ids, none of which are in the batch of 2;
+         no task can be steered
+```
+
+这条消息是对的，同时它就是失败本身：回路的**顺序**错了。batch 必须先存在才能被测量，必须先被测量
+才能被转向，而流水线直接做了第三件事、跳过了前两件。那个手工的两命令绕法被写进了一条注释
+（`probe.py --from-batch`，然后用 `CURRICULUM_SCAN` 重跑），并且从未被执行过——这和 `steer`
+本身是同一个模式：有文档、可用、没跑过。
+
+修法是顺序，`tests/test_rsi_closed_loop.py` 现在把它钉住了——生成在扫描之前，扫的是**那个**
+batch，课程与训练读的是同一份 scan，而 id 不匹配是致命错误而不是一份静默的「0 次移动」计划。
+
+**同一个模式的第三处出现在训练器里。** `train.py` 的行是从硬编码的 `TRAIN_TASK_IDS` 构造的，
+所以即使某份 scan 覆盖到了生成任务，也没有任何一个能到达梯度。它现在接受 `--batch`（`rsi/batch.json`
+或 `rsi/env_batch.json`，两者是不同形状的任务），并把 batch 注册进 `Agent.run` 解析 id 所用的
+进程级任务注册表。`--require-signal` 会在 scan 与行完全不重叠时拒绝，`--dry-run` 在加载模型之前
+就停下，于是接线不占 GPU 也能查。
+
+这对训练曲线意味着什么：两个 128 步的臂训的是 64 行，在每步 2 个唯一 prompt 下，那是对十六个
+冻结 id 训了 16 个 epoch。第 65 步之后 reward 进入平台、`frac_reward_zero_std` 升到 0.66，
+这是记忆的样子，不是能力天花板的样子。生成任务本来就是本仓库用来逃出这个局面的机制，而在今天
+之前，梯度从未见过任何一个。
+
 ## 图表
 
 全部十三张都由 `./run.sh tools/plot.py` 从记录下来的产物重新生成，每一张都在 CI 里被校验：
@@ -542,6 +571,7 @@ cd rsi-multi-harness-rl
 ./run.sh tests/test_rsi_stats.py
 ./run.sh tests/test_rsi_generator.py
 ./run.sh tests/test_rsi_loop.py
+./run.sh tests/test_rsi_closed_loop.py
 ./run.sh tests/smoke_env.py
 ```
 
@@ -552,6 +582,22 @@ RSI 循环本身在默认模式下不需要模型，所以生成器、四道闸�
 ./run.sh tools/check_figures.py
 ./run.sh tools/check_readme_i18n.py
 ```
+
+闭合回路也有一条纯 CPU 路径，改动这四个阶段中任何一个之后，这是检查接线最省的办法：
+
+```bash
+# 1. 写出 batch（对 --seed 确定性）
+./run.sh scripts/rsi_loop.py --batch-only --task-batch 12 --env-batch 4 --seed 11
+# 2. 测量它 —— 这一步才是闭合回路
+./run.sh scripts/probe.py --from-batch outputs/rsi/batch.json \
+    --n 32 --out outputs/rsi/scan_batch.json
+# 3. 不加载模型，检查训练将要消费什么
+./run.sh scripts/train.py --mode multi --steps 1 \
+    --batch outputs/rsi/batch.json --scan outputs/rsi/scan_batch.json \
+    --require-signal --dry-run
+```
+
+`pipeline.sh` 默认就跑这个顺序。`TRAIN_ON_BATCH=0` 可以退回「在随仓库发布的套件上训练」的旧行为。
 
 `run.sh` 是受支持的入口，不是便利脚本。它会设置 `APPDATA`、HuggingFace 缓存目录并清掉
 `PYTHONPATH`，因为在 Windows 上这三者配错时给出的都是**误导性**报错而不是缺依赖报错——

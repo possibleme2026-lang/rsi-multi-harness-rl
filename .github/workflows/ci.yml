@@ -97,6 +97,13 @@ jobs:
           python tests/test_rsi_loop.py
           python tests/test_rsi_curriculum.py
           python tests/test_rsi_envgen.py
+          # The loop, not its parts. Each component of generate -> scan -> steer
+          # -> train was tested and the loop was still open, because the defect
+          # was in the ordering: the curriculum steered a scan of the shipped
+          # suite while the batch it was steering shared no ids with it, and the
+          # trainer read a hardcoded task list so no generated task could reach
+          # the gradient. Nothing raised; the plan just said "0 moves" forever.
+          python tests/test_rsi_closed_loop.py
           python tests/smoke_env.py
           # Gate V1 applied to the harness axis: the reference solution must
           # reach 1.0 through each harness's *own* tools, held-out included.

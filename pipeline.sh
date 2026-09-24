@@ -13,8 +13,9 @@
 #   1. smokes          correctness gates; abort before any GPU time
 #   2. scan            measures pass rates for every (harness, task) cell,
 #                      which train.py needs to drop zero-gradient rows
-#   3. curriculum      reads the scan and plans which tasks to move; with
-#                      APPLY_CURRICULUM=1 it regenerates them and gates them
+#   3. curriculum      generates the batch, scans THAT batch, then steers it;
+#                      with APPLY_CURRICULUM=1 it also regenerates the flagged
+#                      tasks and gates them
 #   4. train single    baseline arm: one harness, free to overfit it
 #   5. train multi     treatment arm: four harnesses, cannot
 #   6. eval            baseline + both arms, on held-out tasks AND the
@@ -24,14 +25,17 @@
 #   bash pipeline.sh                      # full run
 #   STEPS=20 N_EVAL=4 bash pipeline.sh
 #   SKIP_SCAN=1 bash pipeline.sh          # reuse an existing scan
+#   SKIP_BATCH_SCAN=1 bash pipeline.sh    # reuse an existing scan of the batch
 #   SKIP_TRAIN=1 bash pipeline.sh         # re-evaluate existing checkpoints
 #   APPLY_CURRICULUM=1 bash pipeline.sh   # also regenerate the flagged tasks
+#   TRAIN_ON_BATCH=0 bash pipeline.sh     # train on the shipped suite instead
 #
-# The curriculum stage plans by default and regenerates only on request,
-# because regeneration runs the four gates on a fresh batch and that is real
-# shell work. The *plan* is always produced: a steering rule that is computed
-# and never reported is indistinguishable from one that does not exist, which
-# is what this stage was added to fix.
+# Stage 3 is the one that closes the loop, and the ordering in it is the
+# mechanism rather than a detail: a batch has to exist before it can be
+# measured, and measured before it can be steered. Earlier releases generated
+# the batch and steered it with a scan of the shipped suite, which shares no
+# task ids, so the curriculum correctly reported zero moves on every run while
+# the training arms never saw a generated task at all.
 
 set -euo pipefail
 
@@ -80,35 +84,86 @@ else
     --n "$N_SCAN" --tasks "$TRAIN_TASKS" --out "$OUT/scan_all.json"
 fi
 
-banner "STAGE 3/6  curriculum — read the scan, plan the moves"
-# `rsi_loop.py` generates its own batch and writes it to $OUT/rsi/batch.json,
-# then plans against whatever scan it is pointed at. The default scan
-# ($OUT/scan_all.json) measures the *shipped* 24-task suite, which shares no
-# ids with a generated batch, so the plan will correctly report zero moves and
-# say why. That is not a failure — it is the honest answer to "steer a batch
-# you never measured".
+banner "STAGE 3/6  curriculum — generate the batch, scan IT, then steer on that"
+# The curriculum steers a batch by its measured difficulty. That requires a scan
+# of the batch — not a scan of the shipped suite. This stage used to generate
+# the batch and then hand the curriculum $OUT/scan_all.json, which measures the
+# shipped 16 ids; the batch shares none of them, so every run reported
+# `move_count: 0` with the reason "the scan measures 16 task ids, none of which
+# are in the batch of 2". The wiring was correct and the loop was open.
 #
-# To close the loop for real, scan the generated batch first:
-#   bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch.json" \
-#     --n "$N_SCAN" --out "$OUT/rsi/scan_batch.json"
-#   CURRICULUM_SCAN="$OUT/rsi/scan_batch.json" bash pipeline.sh
-# The cost is n x 4 harnesses x batch tasks of rollout time, and it is the
-# price of steering on evidence rather than on the shipped suite's numbers.
-CURRICULUM_ARGS=(--task-batch "${TASK_BATCH:-12}" --scan "${CURRICULUM_SCAN:-$OUT/scan_all.json}")
+# The fix is ordering, and ordering is the whole mechanism: the batch must exist
+# before it can be measured, and it must be measured before it can be steered.
+# Generation is deterministic in --seed, so `--batch-only` writes exactly the
+# batch the full run would have written.
+BATCH_SEED="${BATCH_SEED:-11}"
+TASK_BATCH="${TASK_BATCH:-12}"
+ENV_BATCH_N="${ENV_BATCH_N:-0}"
+
+CURRICULUM_SCAN="$OUT/scan_all.json"
+if [ "${SKIP_BATCH_SCAN:-0}" = "1" ] && [ -f "$OUT/rsi/scan_batch.json" ]; then
+  echo "SKIP_BATCH_SCAN=1 and $OUT/rsi/scan_batch.json exists -> reusing it"
+  CURRICULUM_SCAN="$OUT/rsi/scan_batch.json"
+else
+  echo "-- generating the batch (seed=$BATCH_SEED, tasks=$TASK_BATCH, env=$ENV_BATCH_N)"
+  bash "$RUN" scripts/rsi_loop.py --batch-only \
+    --task-batch "$TASK_BATCH" --env-batch "$ENV_BATCH_N" --seed "$BATCH_SEED"
+
+  # Cost: n x 4 harnesses x batch tasks of rollout time. It is the price of
+  # steering on evidence rather than on the shipped suite's numbers, and there
+  # is no cheaper way to know how hard a generated task is.
+  echo "-- scanning the generated batch (this is the part that closes the loop)"
+  bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch.json" \
+    --n "$N_SCAN" --out "$OUT/rsi/scan_batch.json"
+  CURRICULUM_SCAN="$OUT/rsi/scan_batch.json"
+fi
+
+# The curriculum's scan must cover the ids the batch actually has, or the plan
+# is empty for a reason that has nothing to do with difficulty. Fail loudly here
+# rather than printing "0 moves" as if it were a finding about the tasks.
+bash "$RUN" - "$CURRICULUM_SCAN" "$OUT/rsi/batch.json" <<'PY'
+import json, sys
+scan = json.loads(open(sys.argv[1], encoding="utf-8").read())
+batch = json.loads(open(sys.argv[2], encoding="utf-8").read())
+scan_ids = {str(r.get("task_id")) for r in scan.get("records", [])}
+batch_ids = {str(t["id"]) for t in batch}
+overlap = scan_ids & batch_ids
+print(f"scan ids {len(scan_ids)}  batch ids {len(batch_ids)}  overlap {len(overlap)}")
+if not overlap:
+    sys.exit(f"FATAL: {sys.argv[1]} measures none of the {len(batch_ids)} batch ids; "
+             f"the curriculum would plan zero moves and the scan would filter nothing")
+PY
+
+CURRICULUM_ARGS=(--task-batch "$TASK_BATCH" --seed "$BATCH_SEED" --scan "$CURRICULUM_SCAN")
 if [ "${APPLY_CURRICULUM:-0}" = "1" ]; then
   CURRICULUM_ARGS+=(--apply-curriculum)
 fi
 bash "$RUN" scripts/rsi_loop.py "${CURRICULUM_ARGS[@]}"
 
 if [ "${SKIP_TRAIN:-0}" != "1" ]; then
+  # Training reads the same scan the curriculum steered on, and the batch it
+  # measures. Before this, both arms trained on the shipped 16 ids with a filter
+  # that matched nothing -- 64 rows over 128 steps is 16 epochs, which is
+  # memorisation, and the flat reward curve past step 65 was that and not a
+  # capability limit.
+  TRAIN_BATCH_ARGS=()
+  TRAIN_SCAN_ARGS=()
+  if [ "${TRAIN_ON_BATCH:-1}" = "1" ]; then
+    TRAIN_BATCH_ARGS=(--batch "$OUT/rsi/batch.json" --require-signal)
+    TRAIN_SCAN_ARGS=(--scan "$CURRICULUM_SCAN")
+  else
+    echo "TRAIN_ON_BATCH=0 -> training on the shipped suite with $OUT/scan_all.json"
+    TRAIN_SCAN_ARGS=(--scan "$OUT/scan_all.json")
+  fi
+
   banner "STAGE 4/6  train — SINGLE harness (baseline arm)"
   bash "$RUN" scripts/train.py \
-    --mode single --steps "$STEPS" --scan "$OUT/scan_all.json" \
+    --mode single --steps "$STEPS" "${TRAIN_SCAN_ARGS[@]}" "${TRAIN_BATCH_ARGS[@]}" \
     --tag "single-s${STEPS}"
 
   banner "STAGE 5/6  train — MULTI harness (treatment arm)"
   bash "$RUN" scripts/train.py \
-    --mode multi --steps "$STEPS" --scan "$OUT/scan_all.json" \
+    --mode multi --steps "$STEPS" "${TRAIN_SCAN_ARGS[@]}" "${TRAIN_BATCH_ARGS[@]}" \
     --tag "multi-s${STEPS}"
 else
   echo "SKIP_TRAIN=1 -> reusing checkpoints under $OUT"

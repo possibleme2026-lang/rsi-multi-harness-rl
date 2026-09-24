@@ -118,6 +118,37 @@ before it.
 
 ### Fixed — the defects behind those numbers
 
+- **The RSI loop was open, and every one of its parts passed its tests.** Three
+  defects, all of the same shape — a mechanism that existed, was tested, and was
+  never reached:
+  1. **The curriculum steered a scan of a different task set.** `pipeline.sh`
+     generated a batch and then handed `rsi_loop.py` `scan_all.json`, which
+     measures the shipped 16 ids. The batch's ids are generated hashes, so the
+     sets are disjoint and the plan was empty on every run — reported correctly
+     as `move_count: 0, skipped: "the scan measures 16 task ids, none of which
+     are in the batch of 2"`. The correct two-command workaround was written
+     into a comment and never executed. Fixed by ordering: `rsi_loop.py
+     --batch-only` writes the batch first, `pipeline.sh` scans *that* batch
+     (`probe.py --from-batch`), and the curriculum and the trainer both read the
+     resulting `rsi/scan_batch.json`. An id mismatch is now fatal rather than a
+     silent zero-move plan.
+  2. **The trainer could not see a generated task at all.** `train.py` built its
+     rows from a hardcoded `TRAIN_TASK_IDS`, so no generated task could reach the
+     gradient even once a scan covered it. It now takes `--batch`
+     (`rsi/batch.json` and `rsi/env_batch.json` are different task shapes and both
+     work) and registers the batch into the process-global registry that
+     `Agent.run` resolves ids through — without which a generated id raises
+     `KeyError` *after* the model has loaded. `--require-signal` refuses a scan
+     that measures none of the rows; `--dry-run` stops before the model loads so
+     the wiring is checkable without a GPU.
+  3. **The consequence was in the training curve.** Both 128-step arms trained on
+     64 rows, which at 2 unique prompts per step is 16 epochs over sixteen frozen
+     ids. The reward plateau past step 65 (0.500 / 0.492 / 0.527 / 0.516 across
+     the last four 16-step bins) and the climb of `frac_reward_zero_std` from
+     0.344 to 0.656 are what memorisation looks like — not a capability ceiling,
+     which is what the plateau had been read as. `tests/test_rsi_closed_loop.py`
+     pins all three properties: generation before the scan, the scan of that
+     batch, and both consumers reading it.
 - **The environment scan's before-picture was overwritten by its own re-scan.**
   Both wrote `outputs/rsi/env_scan.json`, and `probe.py` flushes after every cell,
   so the artifact that was the only evidence of the guidance defect was replaced
