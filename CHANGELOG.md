@@ -256,14 +256,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Only one base model and one seed.** Qwen2.5-0.5B-Instruct, chosen so the
   whole experiment fits on an 8 GB laptop GPU. Single-seed results are not
   evidence of reproducibility, and no seed sweep has been run.
-- **The harness axis has only been scored in `ledger-replay` mode.** The
-  artifact records this under `score_mode`, and the README says so beside the
-  numbers rather than in a footnote. Replayed scoring exists so the loop's
-  budget, guard, noise floor, ledger and prune rule can all be exercised on a
-  machine with no GPU — which is the machine CI runs on — but its trajectory is
-  synthetic and must not be read as "the harness got better". The `--score
-  rollout` arm, which rolls the model out against each candidate, has not been
-  run; until it is, the honest statement is that the harness search *works*, not
-  that it *helped*.
+- **The harness axis has been scored in both modes, and the synthetic one was
+  wrong.** The artifact records the mode under `score_mode`, and the README says
+  so beside the numbers rather than in a footnote. Replayed scoring exists so the
+  loop's budget, guard, noise floor, ledger and prune rule can all be exercised
+  on a machine with no GPU — which is the machine CI runs on — but its trajectory
+  is synthetic and must not be read as "the harness got better". Running the
+  `rollout` arm showed that the two constants the replayed mode stood in with
+  were both unmeasured and both wrong, in opposite directions: a base rate of
+  `0.25` for every harness against measured baselines of `0.008 / 0.054 /
+  0.029 / 0.029`, and a floor of `0.05` against a bootstrapped `0.0176`. So the
+  replayed run started ~8× too high and demanded a ~3× too large margin. The
+  measured arm is still running; until it completes, the honest statement is that
+  the harness search *works*, not that it *helped* — and the previously reported
+  replayed trajectory of `0.471 → 0.528` describes the stand-in function rather
+  than a harness.
 
 [Unreleased]: https://github.com/possibleme2026-lang/rsi-multi-harness-rl/commits/main
