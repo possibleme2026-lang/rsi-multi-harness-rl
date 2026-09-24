@@ -134,7 +134,7 @@ different findings.
 **The edit budget is annealed.** `b_t = ceil(b_min + (b_max − b_min)·½(1 + cos(πt/T)))`
 bounds `‖z_t‖₀`, the number of independent edits in one proposal. It is not a
 step size and not a score threshold. For `T=12, b_min=1, b_max=3` the schedule is
-`[3,3,3,3,3,3,2,2,2,2,2,2,1]`.
+`[3,3,3,3,3,3,2,2,2,2,2,2]`.
 
 **Novelty counts structural components only.** A harness whose guidance was
 reworded five times has not explored five regions; rewarding that would push the

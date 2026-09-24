@@ -96,12 +96,26 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n1. edit_budget — the annealed budget")
     # ------------------------------------------------------------------
-    sched = [edit_budget(t, 12, 1, 3) for t in range(13)]
+    # A T-round run has rounds 0..T-1, so the schedule a run actually executes is
+    # `range(T)` — *not* `range(T+1)`. Evaluating round T as well adds a value the
+    # loop never uses, and doing that here is how the README came to quote a
+    # 13-entry schedule for a 12-round run. Both facts are asserted separately
+    # below: the executed schedule, and the formula's endpoint at t=T.
+    sched = [edit_budget(t, 12, 1, 3) for t in range(12)]
     check("starts at b_max", sched[0] == 3, f"{sched}")
-    check("ends at b_min", sched[-1] == 1, f"{sched}")
+    check("the 12-round schedule has 12 entries", len(sched) == 12, f"{len(sched)}")
+    check(
+        "the 12-round schedule is what the README quotes",
+        sched == [3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2],
+        f"{sched}",
+    )
     check("monotone non-increasing", all(a >= b for a, b in zip(sched, sched[1:], strict=False)), f"{sched}")
     check("every value is within [b_min, b_max]", all(1 <= v <= 3 for v in sched), f"{sched}")
     check("it actually changes over the run", len(set(sched)) > 1, f"{sched}")
+    # The formula's own endpoint. `t = T` is outside any T-round run, so this is a
+    # property of the anneal rather than of a schedule, and it is why `b_min` is
+    # reached in the limit even though the last executed round is not yet there.
+    check("the formula reaches b_min at t=T", edit_budget(12, 12, 1, 3) == 1, f"{edit_budget(12, 12, 1, 3)}")
     check("T=0 degenerates to b_min", edit_budget(0, 0, 1, 3) == 1)
     check("a flat budget stays flat", all(edit_budget(t, 10, 2, 2) == 2 for t in range(11)))
     # A longer run anneals more slowly — the schedule is relative, not absolute.
