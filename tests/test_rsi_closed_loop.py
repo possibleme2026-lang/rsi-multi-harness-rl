@@ -226,9 +226,10 @@ def test_train_registers_batch_tasks(tmp: Path) -> None:
         encoding="utf-8",
     )
 
-    # Load train.py as a module in-process (it only defines functions at import
-    # time) and exercise the registration path directly. A subprocess would work
-    # too, but the property under test is a pure function of the batch file.
+    # Load train.py as a module in-process. It is importable without torch,
+    # datasets or trl because the heavy stack is imported inside `main()` past
+    # the dry-run exit -- which is the property that lets this test live in the
+    # dependency-free CI core job at all.
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("_train", _REPO_ROOT / "scripts" / "train.py")
@@ -246,6 +247,16 @@ def test_train_registers_batch_tasks(tmp: Path) -> None:
     check("registry grew by the batch size", len(TASKS) - before == 2)
     resolved = all(get_task(i)["id"] == i for i in ids)
     check("every id resolves through get_task", resolved)
+
+    # build_dataset must not need the training stack either.
+    rows = train.build_dataset(["bash_minimal", "react_tools"], ids, num_generations=8,
+                               per_step_unique=1)
+    check("row builder returns plain dicts", isinstance(rows[0], dict) and len(rows) == 4,
+          f"{len(rows)} rows")
+    check(
+        "rows name the generated ids, not the shipped ones",
+        {r["task_id"] for r in rows} == set(ids),
+    )
 
     # A malformed batch must fail at load, not at rollout time.
     bad = tmp / "bad.json"

@@ -34,10 +34,13 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from datasets import Dataset
-from transformers import AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
-
+# The heavy imports (datasets / transformers / trl / torch) are deliberately
+# NOT at module scope. Everything this script does *before* the model loads --
+# choosing tasks, registering a generated batch, filtering rows against a scan --
+# is pure standard library, and that is the part worth checking in CI's core job
+# and in `--dry-run`. Importing them here made those checks need a GPU stack,
+# which is exactly backwards: the wiring defects are the ones that used to
+# surface only after the model had loaded.
 from multiharness._bootstrap import outputs_root
 from multiharness.harnesses import (
     HELDOUT_HARNESSES,
@@ -86,8 +89,12 @@ def build_dataset(
     task_ids: list[str],
     num_generations: int,
     per_step_unique: int = 2,
-) -> Dataset:
+) -> list[dict]:
     """One row per (task, harness) pair, round-robin so the split is even.
+
+    Returns plain dicts rather than a ``datasets.Dataset`` so that the row
+    construction — which is where the task-selection bugs live — can be checked
+    without the training stack installed. ``main`` wraps the result.
 
     The dataset carries no ``prompt`` column on purpose: the harness's
     ``reset()`` supplies the observation, which is what makes the harness —
@@ -109,7 +116,7 @@ def build_dataset(
 
     if per_step_unique > 1 and len(rows) % per_step_unique:
         rows = rows[: len(rows) - (len(rows) % per_step_unique)]
-    return Dataset.from_list(rows)
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -295,12 +302,11 @@ def main() -> int:
     if not raw_rows:
         print("!! no live rows left after filtering — nothing to train on")
         return 1
-    dataset = Dataset.from_list(raw_rows)
 
     print("=" * 78)
     print(f"TRAIN  mode={args.mode}  harnesses={list(harnesses)}")
     print("=" * 78)
-    print(f"dataset rows       : {len(dataset)} of {len(train_task_ids) * len(harnesses)} possible")
+    print(f"dataset rows       : {len(raw_rows)} of {len(train_task_ids) * len(harnesses)} possible")
     if dead:
         by_h: dict[str, int] = {}
         for h, _ in dead:
@@ -330,11 +336,19 @@ def main() -> int:
         print()
         print("DRY RUN — stopping before the model loads.")
         print(f"  tasks to train on  : {len(seen)}  {seen[:4]}{' ...' if len(seen) > 4 else ''}")
-        print(f"  distinct rows      : {len(dataset)}")
+        print(f"  distinct rows      : {len(raw_rows)}")
         print(f"  source             : {args.batch or 'shipped suite (TRAIN_TASK_IDS)'}")
         for h in harnesses:
             print(f"  {h:<19}: {sum(1 for r in raw_rows if r['environment'] == h)} rows")
         return 0
+
+    # Past this point a real training run is unavoidable, so the heavy stack is
+    # imported here rather than at module scope. See the note at the imports.
+    from datasets import Dataset
+    from transformers import AutoTokenizer
+    from trl import GRPOConfig, GRPOTrainer
+
+    dataset = Dataset.from_list(raw_rows)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     if tokenizer.pad_token is None:
