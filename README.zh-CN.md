@@ -560,7 +560,7 @@ harness 因为与模型毫无关系的原因而得分更低。同一次排查还
 有 25–27 条原始 OS 报错躺在它的兜底分类里。现在它有明确的 OS 报错类别，并会让该次扫描判为
 无效。一个不可能失败的守卫比没有守卫更糟。
 
-**一个读起来像模型失败、实际是 harness 缺陷的问题——它让整次 eval 作废。**
+**一个读起来像模型失败、实际是 harness 缺陷的问题——是真的、已修，但并不是它被归咎的那个零分的原因。**
 `codex_style` 的 `apply_patch` 回退路径，把
 `|| echo '[error] patch tool unavailable or patch failed'` 拼在了 heredoc 终止符**之后**：
 

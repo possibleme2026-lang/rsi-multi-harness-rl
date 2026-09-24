@@ -677,7 +677,8 @@ verdict — "no harness defects" — while 25–27 raw OS errors sat in its catc
 bucket. It now has an explicit OS-error class and fails the scan. A guard that
 cannot fail is worse than no guard.
 
-**A harness defect that read as a model failure — and invalidated a whole eval.**
+**A harness defect that read as a model failure — real, fixed, and not the
+cause of the zero it was blamed for.**
 `codex_style`'s `apply_patch` fallback built its shell command by appending
 `|| echo '[error] patch tool unavailable or patch failed'` *after* the heredoc
 terminator:
