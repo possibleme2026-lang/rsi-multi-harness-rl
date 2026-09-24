@@ -356,6 +356,12 @@ def generate(params: TaskParams) -> dict:
     # nothing called it. Measured on 300 generated tasks: 96 (32%) were
     # affected, and 0 are after this.
     #
+    # The 96 is seed 0. The rate is seed-dependent but tightly concentrated:
+    # over seeds 0/1/7/11/23/42/99/1234 the count is 96/92/85/91/79/90/81/99
+    # out of 300, i.e. 26–33%. `--seed` defaults to 11 in `rsi_loop.py`, which
+    # gives 91 — quote a seed alongside the number or the number is not
+    # reproducible.
+    #
     # An explicit `python_exit` on a *long* answer is still honoured, so the
     # mode stays reachable when the parameters ask for it deliberately.
     if verify_mode == "python_exit" and verifier_gen.recommend_mode(expected) != "python_exit":

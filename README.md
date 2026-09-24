@@ -102,6 +102,9 @@ And because a short answer graded by `python_exit` would ship a brute-forceable
 digest, the generator consults `recommend_mode` rather than trusting its own
 parameter vector. On a 300-task batch, 96 (32%) were demoted before this rule
 was wired in; 0 are now, and `python_exit` stays reachable for long answers.
+That 96 is seed 0 — the rate is seed-dependent but concentrated, 79–99 out of
+300 across eight seeds, and `--seed` defaults to 11, which gives 91. The seed is
+stated because a rate without one is not reproducible.
 
 ## Axis 3 — the harness is evolved, against a measured noise floor
 
@@ -653,7 +656,9 @@ empty paths, `.`, directory targets, and escapes with OS-independent messages.
 drawn independently of the payload, so the generator produced `python_exit` on
 three-character answers — the one combination `verifier_gen`'s own docstring
 names as wrong, because `check_script` lands inside the agent's work directory.
-Measured over 300 tasks: **96 (32%) were affected**. The generator now asks
+Measured over 300 tasks at seed 0: **96 (32%) were affected**. Across eight seeds
+the count runs 79–99 of 300, so the rate is seed-dependent; the seed is quoted
+because the default (`--seed 11`) yields 91, not 96. The generator now asks
 `recommend_mode` instead of trusting its parameter vector; 0 are affected, and an
 explicit long-answer `python_exit` is still honoured. Fixing it exposed a second
 defect in the same commit: `summarise_batch` counted `params["verify_mode"]`, so

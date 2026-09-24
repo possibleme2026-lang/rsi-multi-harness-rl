@@ -295,7 +295,9 @@ def main() -> int:
     # generator happily produced `python_exit` on a 3-character answer — the one
     # combination `verifier_gen`'s docstring names as wrong, because the checker
     # stores a digest and a short digest is worth brute-forcing. Nothing called
-    # `recommend_mode`. Measured over 300 tasks, 96 (32%) were affected.
+    # `recommend_mode`. Measured over 300 tasks at seed 0, 96 (32%) were
+    # affected; across eight seeds the count runs 79–99, so the seed is part of
+    # the claim rather than a detail.
     wide = task_gen.generate_batch(300, seed=0)
     bf = [t["id"] for t in wide if verifier_gen.discrimination_report(t)["digest_brute_forceable"]]
     check("no generated task ships a brute-forceable digest", not bf, f"{len(bf)} offenders, e.g. {bf[:3]}")
@@ -325,6 +327,42 @@ def main() -> int:
             if t["params"]["verify_mode"] == "python_exit" and t["verify"] != "python_exit"
         ),
     )
+    # The headline "96 (32%) were affected" is a *seed-dependent* number, and the
+    # README, CHANGELOG and the generator docstring all quote it. Nothing pinned
+    # it, so a change to the tier mix could have silently invalidated all three.
+    # Pin both the value at the quoted seed and the spread across seeds, so the
+    # documents cannot drift away from the generator.
+    demoted_0 = sum(
+        1
+        for t in wide
+        if t["params"]["verify_mode"] == "python_exit" and t["verify"] != "python_exit"
+    )
+    check(
+        "the documented 96 demotions at seed 0 still hold",
+        demoted_0 == 96,
+        f"{demoted_0} — README/CHANGELOG/docstring say 96",
+    )
+    spread = []
+    for s in (1, 7, 11, 23, 42, 99, 1234):
+        b = task_gen.generate_batch(300, seed=s)
+        spread.append(
+            sum(
+                1
+                for t in b
+                if t["params"]["verify_mode"] == "python_exit" and t["verify"] != "python_exit"
+            )
+        )
+    check(
+        "the documented seed spread of 79–99 still holds",
+        all(79 <= n <= 99 for n in spread),
+        f"seeds 1/7/11/23/42/99/1234 gave {spread}",
+    )
+    check(
+        "the default seed 11 does not reproduce the seed-0 number",
+        spread[2] != demoted_0,
+        f"seed 11 gave {spread[2]}, seed 0 gave {demoted_0} — the docs must name the seed",
+    )
+
     # An explicitly requested long-answer python_exit must be honoured, or the
     # correction has quietly removed a mode the sweeps rely on.
     long_pe = task_gen.generate(

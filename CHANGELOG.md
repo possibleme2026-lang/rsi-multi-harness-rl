@@ -123,8 +123,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   drawn independently of the payload, so the generator produced `python_exit` on
   three-character answers — the one combination `verifier_gen`'s own docstring
   names as wrong, because `check_script` lands inside the agent's work directory.
-  Measured over 300 tasks: **96 (32%) were affected**. Now 0, and an explicit
-  long-answer `python_exit` is still honoured.
+  Measured over 300 tasks at seed 0: **96 (32%) were affected** — 79–99 across
+  eight seeds, so the seed is quoted; the `--seed 11` default yields 91. Now 0,
+  and an explicit long-answer `python_exit` is still honoured.
 
 - **`summarise_batch` reported the wrong mode counts.** Exposed by the fix above:
   it counted `params["verify_mode"]` (requested) rather than what the tasks use,
