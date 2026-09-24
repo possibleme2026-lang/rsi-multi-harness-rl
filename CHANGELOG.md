@@ -141,16 +141,29 @@ before it.
      `KeyError` *after* the model has loaded. `--require-signal` refuses a scan
      that measures none of the rows; `--dry-run` stops before the model loads so
      the wiring is checkable without a GPU.
-  3. **The consequence was in the training curve.** Both 128-step arms trained on
-     64 rows drawn from sixteen frozen ids — **4.0 epochs**, per the logged
-     `epoch` field (0.03125 = 2/64 at step 1, 4.0 at step 128). The reward
-     plateau past step 65 (0.500 / 0.492 / 0.527 / 0.516 across the last four
-     16-step bins) and `frac_reward_zero_std` climbing 0.344 -> 0.656 are
-     consistent with memorising a small fixed set. What is *not* claimed: 4
-     epochs of a 0.5B model is not obviously enough to have saturated, so the
-     plateau shows this configuration stopped improving, not that the task set is
-     its only cause. What the fix does establish is that the gradient never saw a
-     generated task — a defect regardless of what the plateau means.
+  3. **The consequence was in the training curve.** All four arms train on the
+     same sixteen frozen ids, but `multi` builds one row per (harness, task) pair
+     and `single` only one per task, so at a fixed step count the arms see very
+     different epoch counts. The logged `epoch` field:
+
+     | arm | rows | steps | epochs | zero-gradient |
+     | --- | --- | --- | --- | --- |
+     | `multi-s64` | 64 | 64 | 2.00 | 17/64 = 26.6% |
+     | `multi-s128` | 64 | 128 | 4.00 | 43/128 = 33.6% |
+     | `single-s64` | 16 | 64 | 8.00 | 26/64 = 40.6% |
+     | `single-s128` | 16 | 128 | 16.00 | 67/128 = 52.3% |
+
+     Monotone: more epochs over the same sixteen ids means more GRPO groups with
+     no within-group variance, hence no gradient. The functional form is *not*
+     resolvable from these four points — linear (R²=0.975) and log₂ (R²=0.982)
+     both fit, because the epoch values are consecutive powers of two. An earlier
+     revision of this entry said "both 128-step arms trained on 64 rows ... 4.0
+     epochs", which was wrong for `single` (16 rows, 16.0 epochs).
+
+     What is *not* claimed: 16 epochs of a 0.5B model is not obviously enough to
+     have saturated, so this shows the configuration stopped improving, not that
+     the task set is its only cause. What the fix does establish is that the
+     gradient never saw a generated task — a defect regardless of the plateau.
      `tests/test_rsi_closed_loop.py` pins all three properties: generation before
      the scan, the scan of that batch, and both consumers reading it.
 - **The environment scan's before-picture was overwritten by its own re-scan.**

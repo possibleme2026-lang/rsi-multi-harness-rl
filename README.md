@@ -502,16 +502,38 @@ resolves ids through. `--require-signal` refuses a scan that measures none of th
 rows, and `--dry-run` stops before the model loads so the wiring is checkable
 without a GPU.
 
-Why this matters for the training curve: the two 128-step arms trained on 64
-rows drawn from sixteen frozen ids, which the logged `epoch` field puts at
-**4.0 epochs** (`epoch` is 0.03125 = 2/64 at step 1 and 4.0 at step 128). The
-reward plateau past step 65 and the rise of `frac_reward_zero_std` to 0.66 are
-consistent with memorisation of a small fixed set — and generated tasks are the
-mechanism the repository already had for escaping that. Note what is *not*
-claimed here: 4 epochs of a 0.5B model is not obviously enough to have saturated,
-so the plateau is evidence that this particular setup stopped improving, not proof
-that the task set is the only cause. It is proof that the gradient never saw a
-generated task, which is a defect regardless of what the plateau means.
+Why this matters for the training curve. All four arms train on the same sixteen
+frozen ids, but the number of *rows* differs by mode — `multi` builds one row per
+(harness, task) pair, `single` only one per task — so at a fixed step count the
+two arms see very different numbers of epochs. The logged `epoch` field gives the
+exact figures:
+
+| arm | rows | steps | epochs | zero-gradient steps |
+| --- | --- | --- | --- | --- |
+| `multi-s64` | 64 | 64 | 2.00 | 17/64 = 26.6% |
+| `multi-s128` | 64 | 128 | 4.00 | 43/128 = 33.6% |
+| `single-s64` | 16 | 64 | 8.00 | 26/64 = 40.6% |
+| `single-s128` | 16 | 128 | 16.00 | 67/128 = 52.3% |
+
+**The relationship is monotone and it is the useful finding here.** More epochs
+over the same sixteen ids means a larger share of GRPO groups with no within-group
+variance, which means no gradient: 26.6% at 2 epochs rising to 52.3% at 16. What
+the four points *cannot* settle is the functional form — both a linear fit
+(R²=0.975) and a log₂ fit (R²=0.982) describe them well, because the epoch values
+happen to be consecutive powers of two. So the honest claim is monotone increase,
+not a rate law.
+
+An earlier revision of this section said "the two 128-step arms trained on 64
+rows ... 4.0 epochs". That was wrong for the `single` arm, which has 16 rows and
+reaches 16.0 epochs — four times as many. The `single-s128` arm is the one that
+spent the most epochs on the least data, and it is the one with the most wasted
+gradient.
+
+What is *not* claimed: 16 epochs of a 0.5B model is not obviously enough to have
+saturated, so this is evidence that the setup stopped improving, not proof that
+the task set is the only cause. What the loop fix does establish is that the
+gradient never saw a generated task, which is a defect regardless of what the
+plateau means.
 
 **The generated tasks' difficulty is measured, but thinly.** This is worth
 stating precisely, because it is easy to overclaim in either direction. The two
