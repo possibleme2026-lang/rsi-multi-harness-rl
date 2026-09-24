@@ -165,10 +165,42 @@ Replayed mode exists so the loop's machinery can be run and tested on the machin
 CI runs on, which has no GPU. It is **not** a model measurement, and reading the
 trajectory `[0.471, 0.528, 0.528, …]` as "the harness got better" would be
 wrong — it is a synthetic curve whose only job is to reach every branch of the
-loop. The `rollout` arm has not been run yet; when it is, the same artifact
-carries the real number and `score_mode` changes with it. The noise floor in the
-replayed artifact is labelled `fixed fallback` for the same reason: a single
-score per state cannot support a bootstrap floor.
+loop. The noise floor in the replayed artifact is labelled `fixed fallback` for
+the same reason: a single score per state cannot support a bootstrap floor.
+
+**The `rollout` arm has now been run, and its first output is a correction to the
+table above.** The four trainable harnesses, scored by the *unmodified* base
+model over the same 30 generated tasks × 8 rollouts, come out at:
+
+| harness | measured baseline | replayed stand-in |
+| --- | --- | --- |
+| `bash_minimal` | **0.008** | 0.25 |
+| `react_tools` | **0.054** | 0.25 |
+| `json_strict` | **0.029** | 0.25 |
+| `longctx_summary` | **0.029** | 0.25 |
+
+Every real score is **3–30× below** the `0.25` the stand-in assumed for all four,
+and the stand-in gave all four the *same* number while the real harnesses differ
+by nearly 7×. So the replayed trajectory was not merely uninformative about
+whether the harness improved — it was built on a base rate that is wrong by an
+order of magnitude, which is why the accepted edits in that run look like they
+"improved" something from 0.471 to 0.528. Those numbers describe the stand-in
+function, not a harness.
+
+**The noise floor moves too, and in the other direction.** Bootstrapped from the
+measured rollouts it comes out at **0.0176**, against the `0.05` the replayed
+mode falls back to — a factor of 2.8. So the synthetic run was simultaneously
+starting from a base rate ~8× too high *and* demanding a margin ~3× too large
+before accepting an edit. Neither number was measured, both decided every accept
+in that run, and they erred in opposite directions — which is why the replayed
+result looked plausible rather than obviously broken.
+
+The measured baseline is also the honest context for the ablation: ~0.03 is what
+an untrained 0.5B model scores when scored by this harness pool on generated
+tasks, which is consistent with the 0.1406 the shipped suite gives it on the
+train harnesses — generated tasks are harder, as gate V4 intends them to be.
+The full measured evolution is still running; when it lands, `outputs_rollout/`
+carries `score_mode: rollout` and fig10 is drawn from that ledger instead.
 
 ## The gates, and why there are four
 
