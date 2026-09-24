@@ -43,6 +43,7 @@ from multiharness.harnesses import (
     HELDOUT_HARNESSES,
     TRAIN_HARNESSES,
 )
+from multiharness.rsi import stats as rsi_stats
 from multiharness.tasks import load as load_tasks
 from multiharness.tasks.suite import TRAIN_TASK_IDS
 
@@ -84,38 +85,67 @@ def build_dataset(
 # signal filter
 # --------------------------------------------------------------------------
 # A binary reward gives GRPO a gradient only when the completions *within a
-# group* disagree. For a task the model always passes (p=1) or never passes
-# (p=0), every group of size G has zero variance with probability 1 — those
-# rows are pure compute burn and, worse, they dilute the logged mean reward so
-# a run can look like it is learning when nothing is moving.
+# group* disagree. The probability a group of size G carries no gradient is
+# ``p^G + (1-p)^G``, which is 1 only at p=0 and p=1. At p=0.05 and G=8 it is
+# 0.6634 — so 33.7% of groups on such a row still carry gradient, and calling
+# the row "provably dead" is simply wrong arithmetic.
 #
-# Measured on this machine (probe.py, n=8): T2 and most of T3 sit at p=0.00
-# for every harness, so a naive training set is more than half dead rows.
+# This function used to drop every row with ``p <= 0.05 or p >= 0.95``, which is
+# what that mistake looks like in code. It discarded rows on a *point estimate*
+# from an n=8 scan, where a measured 0/8 has a 95% upper bound of 0.312 and a
+# cell whose true rate is 0.30 shows 0/8 about 5.8% of the time. A discarded row
+# is not a dead row, and the difference is the whole point of `rsi/stats.py`.
+#
+# The filter now asks the statistics layer for a verdict and drops a row only
+# when the confidence interval excludes the signal band outright — which, at
+# zero passes, needs n >= 73. Rows that are merely under-measured are KEPT and
+# reported, because the alternative is a training set silently shaped by the
+# sample size of a scan rather than by the task's difficulty.
 #
 # The filter is applied at *dataset construction* using pass rates measured
 # beforehand, never during training, so it cannot leak eval information.
-# Thresholds are deliberately wide: 0.05 < p < 0.95 keeps everything with
-# any chance of signal while excluding the certain-dead rows.
 
-SIGNAL_LO = 0.05
-SIGNAL_HI = 0.95
+#: Kept as module-level names because other tooling and the tests read them.
+SIGNAL_LO = rsi_stats.SIGNAL_LO
+SIGNAL_HI = rsi_stats.SIGNAL_HI
 
 
 def filter_live_rows(
-    rows: list[dict], pass_rates: dict[tuple[str, str], float]
-) -> tuple[list[dict], list[tuple[str, str]]]:
-    """Drop (harness, task) pairs whose measured pass rate is certainly dead."""
-    live, dead = [], []
+    rows: list[dict],
+    pass_rates: dict[tuple[str, str], float],
+    counts: dict[tuple[str, str], tuple[int, int]] | None = None,
+) -> tuple[list[dict], list[tuple[str, str]], list[tuple[str, str]]]:
+    """Drop rows whose interval excludes the signal band; report the rest.
+
+    Returns ``(live, dead, under_measured)``. ``counts`` maps a cell to its
+    ``(passes, n)``; without it the pass rate alone cannot support any verdict,
+    so nothing is dropped and every measured row is reported as under-measured
+    rather than being silently discarded on a point estimate.
+    """
+    live, dead, thin = [], [], []
     for r in rows:
         key = (r["environment"], r["task_id"])
         p = pass_rates.get(key)
         if p is None:
             live.append(r)  # unmeasured: keep, do not silently drop data
-        elif SIGNAL_LO < p < SIGNAL_HI:
+            continue
+        pn = (counts or {}).get(key)
+        if pn is None:
+            # A bare rate with no sample size. Keep it: the old code dropped it
+            # whenever it sat near an edge, which is exactly the false certainty
+            # `rsi/stats.py` exists to remove.
             live.append(r)
-        else:
+            thin.append(key)
+            continue
+        passes, n = pn
+        verdict = rsi_stats.classify_cell(passes, n, harness=key[0], task_id=key[1]).verdict
+        if verdict is rsi_stats.CellVerdict.DEAD:
             dead.append(key)
-    return live, dead
+        else:
+            live.append(r)
+            if verdict is rsi_stats.CellVerdict.UNDER_MEASURED:
+                thin.append(key)
+    return live, dead, thin
 
 
 def main() -> int:
@@ -163,13 +193,25 @@ def main() -> int:
             raw_rows.append({"environment": h, "task_id": tid})
 
     pass_rates: dict[tuple[str, str], float] = {}
+    counts: dict[tuple[str, str], tuple[int, int]] = {}
     dead: list[tuple[str, str]] = []
+    thin: list[tuple[str, str]] = []
     if args.scan and not args.no_filter:
         scan = json.loads(Path(args.scan).read_text(encoding="utf-8"))
         for h, per_task in scan.get("matrix", {}).items():
             for tid, p in per_task.items():
                 pass_rates[(h, tid)] = float(p)
-        raw_rows, dead = filter_live_rows(raw_rows, pass_rates)
+        # Recover (passes, n) from the raw records so the verdict rests on a
+        # confidence interval rather than on the point estimate the matrix
+        # stores. A scan without records cannot support a DEAD verdict, and
+        # `filter_live_rows` degrades to keeping everything.
+        for r in scan.get("records", []):
+            key = (str(r.get("harness", "")), str(r.get("task_id", "")))
+            if not all(key):
+                continue
+            passes, n = counts.get(key, (0, 0))
+            counts[key] = (passes + int(float(r.get("reward", 0.0)) >= 1.0), n + 1)
+        raw_rows, dead, thin = filter_live_rows(raw_rows, pass_rates, counts)
 
     # Keep only rows whose harness is actually in this arm (single mode).
     raw_rows = [r for r in raw_rows if r["environment"] in harnesses]
@@ -189,8 +231,15 @@ def main() -> int:
         by_h: dict[str, int] = {}
         for h, _ in dead:
             by_h[h] = by_h.get(h, 0) + 1
-        print(f"dropped as dead    : {len(dead)} rows  (p<=0.05 or p>=0.95) {by_h}")
-    elif not args.scan:
+        print(f"dropped as DEAD    : {len(dead)} rows  (interval excludes the signal band) {by_h}")
+    if thin:
+        by_h = {}
+        for h, _ in thin:
+            by_h[h] = by_h.get(h, 0) + 1
+        print(
+            f"kept but thin      : {len(thin)} rows  (UNDER_MEASURED — kept, not discarded) {by_h}"
+        )
+    if not args.scan:
         print("signal filter      : OFF (no --scan given); expect many zero-gradient steps")
     print(f"unique prompts/step: {per_step_unique}   completions/step: {args.per_device_batch}")
     print(f"steps              : {args.steps}   lr={args.lr}   lora_r={args.lora_r}")
@@ -275,6 +324,7 @@ def main() -> int:
         "train_tasks": TRAIN_TASK_IDS,
         "rows_used": len(raw_rows),
         "rows_dropped_dead": [[h, t] for h, t in dead],
+        "rows_kept_under_measured": [[h, t] for h, t in thin],
         "scan": args.scan,
         "steps": args.steps,
         "lr": args.lr,

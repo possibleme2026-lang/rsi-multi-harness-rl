@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+# Copyright 2026 The rsi-multi-harness-rl Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Run the RSI loop and write the artifacts the figures read.
+
+    ./run.sh scripts/rsi_loop.py --rounds 6
+    ./run.sh scripts/rsi_loop.py --rounds 6 --task-batch 40
+
+What this actually does
+-----------------------
+Two things, both of which write evidence rather than claims.
+
+**The task axis.** Generates a batch of tasks from the parameter space, runs
+all four validation gates on each, and writes the accept/reject counts. This is
+the part that can be done without a model: gates V1–V3 need only a shell, and
+V4's structural half needs nothing at all. The result is a real accept rate for
+a real batch, not an assertion that the generator works.
+
+**The harness axis.** Runs the evolutionary loop over the harness edit space.
+Each round proposes edits within the annealed budget, and scores the candidate
+against the incumbent. Scoring here is *measured*, not simulated: every
+candidate is rolled out on the task batch and its pass rate is the score.
+
+Two modes
+---------
+``--score ledger-replay`` (default when no model is available)
+    Scores candidates with a deterministic stand-in derived from the edit
+    itself, so the loop's *machinery* — budget, guard, floor, ledger, prune —
+    runs end to end without a GPU. The ledger it produces is real in the sense
+    that matters for testing the machinery, and it is labelled as replayed in
+    the artifact so no figure can present it as a model measurement.
+
+``--score rollout``
+    Rolls the candidate harness out against the model on the task batch. This
+    is the honest number and it needs a GPU and a loaded model. It is
+    substantially slower, so it is opt-in rather than the default.
+
+The distinction is recorded in the output under ``score_mode``, because a
+figure that showed a replayed trajectory as if it were a measured one would be
+the exact kind of unearned claim this project exists to avoid.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from multiharness._bootstrap import outputs_root  # noqa: E402
+from multiharness.rsi import harness_evolve as he  # noqa: E402
+from multiharness.rsi import task_gen, validate  # noqa: E402
+from multiharness.rsi.ledger import Ledger, edit_budget  # noqa: E402
+from multiharness.rsi.stats import noise_floor  # noqa: E402
+
+#: Artifacts land in ``<repo>/outputs/rsi``, or ``$MULTIHARNESS_OUT/rsi``.
+#:
+#: This used to be ``ROOT / "outputs" / "rsi"``, which ignored
+#: ``MULTIHARNESS_OUT`` while ``probe.py``, ``train.py`` and ``eval.py`` all
+#: honoured it — so a redirected pipeline wrote its scan, checkpoints and eval
+#: to one place and this loop's artifacts to another, and the documented
+#: override silently applied to only part of a run. ``outputs_root`` is the
+#: single definition; the ``rsi`` subdirectory is this script's own namespace.
+OUT = outputs_root() / "rsi"
+
+
+# --------------------------------------------------------------------------
+# the task axis
+# --------------------------------------------------------------------------
+
+
+def run_task_axis(batch_size: int, seed: int, root: Path) -> dict:
+    """Generate a batch and put every task through the four gates."""
+    print("=" * 74)
+    print("TASK AXIS — generate a batch, then try to falsify each task")
+    print("=" * 74)
+    t0 = time.time()
+    batch = task_gen.generate_batch(batch_size, seed=seed)
+    cov = task_gen.summarise_batch(batch)
+    print(f"generated {cov['total']} tasks in {time.time() - t0:.1f}s")
+    print(f"  by tier       : {cov['by_tier']}")
+    print(f"  by verify mode: {cov['by_verify_mode']}   (what the tasks use)")
+    print(f"  mode requested: {cov['by_verify_mode_requested']}   (what the parameters asked for)")
+    print(f"  mode overrides: {cov['mode_overrides']}   (short answer: a digest would be brute-forceable)")
+    print(f"  by step count : {cov['by_steps']}")
+    print(f"  with a source file: {cov['with_source_file']}")
+    print()
+
+    t0 = time.time()
+    verdicts = validate.validate_batch(batch, roots=root / "gates")
+    summary = validate.summarise_validation(verdicts)
+    print(f"validated in {time.time() - t0:.1f}s")
+    print(f"  accepted {summary['accepted']}/{summary['total']}")
+    print(f"  failures by gate: {summary['failures_by_gate'] or 'none'}")
+    for tier, d in sorted(summary["by_tier"].items()):
+        print(f"    {tier}: {d['accepted']}/{d['total']}")
+    print()
+
+    # The rejection details are what make a failure actionable, so they are
+    # written out rather than reduced to a count.
+    rejected = [
+        {"task_id": v.task_id, "tier": v.tier, "failed_gates": v.failed_gates,
+         "details": {g.gate: g.detail for g in v.gates if not g.passed}}
+        for v in verdicts
+        if not v.accepted
+    ]
+    return {
+        "coverage": cov,
+        "summary": summary,
+        "rejected": rejected,
+        "verdicts": [v.as_dict() for v in verdicts],
+    }
+
+
+# --------------------------------------------------------------------------
+# scoring
+# --------------------------------------------------------------------------
+
+
+def replayed_score(state: he.HarnessState, rng: random.Random, base: float) -> float:
+    """A deterministic stand-in score for one harness state.
+
+    Built so that the loop's machinery is exercised in a way that resembles a
+    real run: edits that add actionable guidance help a little, the tool-drop
+    edit is a coin flip, and every measurement carries sampling noise. That is
+    enough for the budget, the guard, the noise floor, the ledger and the prune
+    rule to all be reached.
+
+    It is **not** a model measurement and the artifact says so. Its only
+    purpose is to let the loop be run and tested without a GPU; the honest
+    numbers come from ``--score rollout``.
+    """
+    help_by_edit = {
+        "guidance+=submit_echo": 0.09,
+        "guidance+=retry_hint": 0.11,
+        "guidance+=exactness": 0.07,
+        "guidance+=one_line": 0.05,
+        "prompt-=verbose_preamble": 0.04,
+        "output_plumbing+=explicit_path": 0.08,
+        "context_mgmt+=keep_last_error": 0.03,
+        "client_tool-=read_file": -0.01,
+    }
+    gain = sum(help_by_edit.get(name, 0.0) for name in state.history)
+    # Diminishing returns, so the loop cannot climb forever on one component.
+    gain = 0.30 * (1.0 - pow(2.718281828, -gain / 0.15))
+    noise = rng.gauss(0.0, 0.035)
+    return max(0.0, min(1.0, base + gain + noise))
+
+
+def rollout_score(state: he.HarnessState, tasks: list[dict], *, n: int, agent) -> float:
+    """Roll a candidate harness out against the model. The honest number.
+
+    The driver takes an environment *class*, so the state is materialised via
+    :func:`rsi.harness_evolve.to_env_class` — that conversion is the single
+    point where the evolver's data becomes executable.
+
+    The generated batch is registered first. ``Agent.run`` resolves ``task_id``
+    through ``core.get_task``, which reads a process-global registry populated
+    by ``tasks.suite.load()`` — the *shipped* 24 tasks. Generated ids live only
+    in the batch list, so without this the first rollout dies on
+    ``KeyError: unknown task_id 't4-c1ff0a35'``. It also means the suite has to
+    be loaded, because a *fresh process* starts with an empty registry and
+    ``reset`` would fail on the shipped ids for the same reason.
+
+    The task dicts are registered as-is: the generator's output is documented
+    as a superset of what ``register_tasks`` expects, and ``core.verify`` reads
+    ``verify`` / ``expected`` / ``check_script`` straight off the task, so no
+    translation is needed or wanted here.
+    """
+    from multiharness.harnesses.core import TASKS, register_tasks
+    from multiharness.tasks import load as _load_suite
+
+    _load_suite()
+    fresh = [t for t in tasks if t["id"] not in TASKS]
+    if fresh:
+        register_tasks(fresh)
+
+    cls = he.to_env_class(state, _BASE_CLASS[state.name])
+    rewards: list[float] = []
+    for t in tasks:
+        rewards.extend(r.reward for r in agent.run(cls, t["id"], n=n))
+    return sum(rewards) / len(rewards) if rewards else 0.0
+
+
+#: Base classes by harness name, resolved lazily so importing this module does
+#: not require torch.
+_BASE_CLASS: dict[str, type] = {}
+
+
+def _resolve_bases() -> None:
+    if _BASE_CLASS:
+        return
+    from multiharness.harnesses.pool import ALL_HARNESSES
+
+    _BASE_CLASS.update(ALL_HARNESSES)
+
+
+# --------------------------------------------------------------------------
+# the harness axis
+# --------------------------------------------------------------------------
+
+
+def run_harness_axis(
+    rounds: int,
+    *,
+    score_mode: str,
+    tasks: list[dict],
+    n_rollouts: int,
+    seed: int,
+    b_min: int,
+    b_max: int,
+    agent=None,
+) -> dict:
+    print("=" * 74)
+    print(f"HARNESS AXIS — evolve the interface, score_mode={score_mode}")
+    print("=" * 74)
+
+    rng = random.Random(seed)
+    ledger = Ledger(OUT / "ledger.jsonl")
+    _resolve_bases()
+
+    # Start from the real harnesses as they exist, so the evolution is a
+    # continuation of the shipped interfaces rather than of a blank slate.
+    states: dict[str, he.HarnessState] = {}
+    for name in he.EVOLVABLE_HARNESSES:
+        cls = _BASE_CLASS.get(name)
+        if cls is None:
+            continue
+        env = cls()
+        tools = tuple(sorted(m.__name__ for m in _public_tools(env)))
+        base = he.HarnessState(name=name, guidance=env.GUIDANCE, tools=tools)
+        base.score = _score(base, score_mode, rng, tasks, n_rollouts, agent)
+        states[name] = base
+        print(f"  {name:<18} baseline score {base.score:.3f}  tools={tools}")
+
+    # The floor is sized from the observed spread rather than assumed. With no
+    # repeated measurements to pool (replayed mode produces one score per
+    # state) it falls back to a fixed fraction, and that fallback is reported
+    # rather than hidden, because the floor is what decides every accept.
+    if score_mode == "rollout":
+        per_cell = _reward_samples(states, tasks, n_rollouts, agent)
+        floor = noise_floor(per_cell) if per_cell else 0.05
+        floor_source = "bootstrap over measured rollouts"
+    else:
+        floor = 0.05
+        floor_source = "fixed fallback (replayed scoring produces one score per state)"
+    print(f"  noise floor {floor:.4f}  ({floor_source})")
+    print()
+
+    trajectory: list[float] = []
+    for t in range(rounds):
+        budget = edit_budget(t, rounds, b_min, b_max)
+        for hname, incumbent in list(states.items()):
+            # Stall is per harness: one interface exhausting its neighbourhood
+            # says nothing about whether another has.
+            allow_pruned = ledger.stalled(w=3, delta=floor, harness=hname)
+            proposals = he.propose_edits(incumbent, ledger, budget, rng=rng, allow_pruned=allow_pruned)
+            if not proposals:
+                continue
+            for edit in proposals:
+                cand = he.apply_edit(incumbent, edit)
+                ok, why = he.guard_candidate(cand)
+                if not ok:
+                    ledger.append(
+                        he.EditRecord(
+                            round=t, candidate_id=f"{hname}-r{t}-{edit.name}", edit=edit.name,
+                            harness=hname, components=(edit.component,),
+                            score_before=incumbent.score, score_after=incumbent.score,
+                            delta=0.0, floor=floor, accepted=False, reason=f"guard: {why}",
+                        )
+                    )
+                    continue
+                cand.score = _score(cand, score_mode, rng, tasks, n_rollouts, agent)
+                accepted, rec = he.judge_candidate(
+                    cand, incumbent, floor=floor, round_index=t,
+                    candidate_id=f"{hname}-r{t}-{edit.name}", edit=edit,
+                    meta={"score_mode": score_mode, "rationale": edit.rationale},
+                )
+                ledger.append(rec)
+                if accepted:
+                    states[hname] = cand
+                    incumbent = cand
+        best = max(s.score for s in states.values())
+        trajectory.append(best)
+        print(
+            f"  round {t}: budget={budget}  best={best:.3f}  "
+            f"attempts={ledger.attempted()}  accepted={len(ledger.accepted_edits())}"
+        )
+
+    summary = ledger.summary()
+    print()
+    print(f"  attempted {summary['attempted']}, accepted {summary['accepted']} "
+          f"({summary['accept_rate']:.0%})")
+    print(f"  rejected worse={summary['rejected_worse']}, "
+          f"within-noise={summary['rejected_within_noise']}")
+    print(f"  yield per component: {summary['yield_per_component']}")
+    print(f"  prune set: {summary['prune_set'] or 'none'}")
+    print()
+
+    return {
+        "score_mode": score_mode,
+        "rounds": rounds,
+        "floor": floor,
+        "floor_source": floor_source,
+        "ledger": summary,
+        "trajectory": trajectory,
+        "final_states": {k: v.as_dict() for k, v in states.items()},
+        "winning_edits": {
+            k: [r.edit for r in ledger.records if r.accepted and r.harness == k] for k in states
+        },
+    }
+
+
+def _public_tools(env) -> list:
+    import inspect
+
+    return [
+        m for n, m in inspect.getmembers(env, predicate=inspect.ismethod)
+        if not n.startswith("_") and n not in ("reset", "get_reward")
+    ]
+
+
+def _score(state, mode, rng, tasks, n_rollouts, agent) -> float:
+    if mode == "rollout":
+        return rollout_score(state, tasks, n=n_rollouts, agent=agent)
+    return replayed_score(state, rng, base=0.25)
+
+
+def _reward_samples(states, tasks, n_rollouts, agent) -> list[list[float]]:
+    """Every reward from the baseline rollouts, pooled for the noise floor."""
+    out: list[list[float]] = []
+    for s in states.values():
+        try:
+            cls = he.to_env_class(s, _BASE_CLASS[s.name])
+            rs: list[float] = []
+            for t in tasks:
+                rs.extend(r.reward for r in agent.run(cls, t["id"], n=n_rollouts))
+            if rs:
+                out.append(rs)
+        except Exception:
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Run the RSI loop and record its evidence.")
+    ap.add_argument("--rounds", type=int, default=6)
+    ap.add_argument("--task-batch", type=int, default=30, help="tasks to generate and validate")
+    ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--score", choices=["ledger-replay", "rollout"], default="ledger-replay")
+    ap.add_argument("--n-rollouts", type=int, default=8, help="rollouts per task when --score rollout")
+    ap.add_argument("--max-turns", type=int, default=4, help="matches scripts/probe.py")
+    ap.add_argument("--max-new-tokens", type=int, default=192, help="matches scripts/probe.py")
+    ap.add_argument("--b-min", type=int, default=1)
+    ap.add_argument("--b-max", type=int, default=3)
+    args = ap.parse_args()
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    # Start each run from an empty ledger. Appending to a previous run's ledger
+    # would make `tried()` claim edits were attempted when they were attempted
+    # in a different experiment, and the yield statistics would be a mixture.
+    ledger_path = OUT / "ledger.jsonl"
+    if ledger_path.exists():
+        ledger_path.unlink()
+
+    agent = None
+    if args.score == "rollout":
+        print("loading model for rollout scoring ...")
+        from multiharness.rollout import Agent
+
+        agent = Agent(max_turns=args.max_turns, max_new_tokens=args.max_new_tokens)
+        print(f"model: {agent.model_id} on {agent.device}\n")
+
+    task_result = run_task_axis(args.task_batch, args.seed, OUT)
+    (OUT / "validation.json").write_text(json.dumps(task_result, indent=2), encoding="utf-8")
+    print(f"wrote {OUT / 'validation.json'}\n")
+
+    harness_result = run_harness_axis(
+        args.rounds,
+        score_mode=args.score,
+        tasks=task_gen.generate_batch(args.task_batch, seed=args.seed),
+        n_rollouts=args.n_rollouts,
+        seed=args.seed,
+        b_min=args.b_min,
+        b_max=args.b_max,
+        agent=agent,
+    )
+    (OUT / "harness.json").write_text(json.dumps(harness_result, indent=2), encoding="utf-8")
+    print(f"wrote {OUT / 'harness.json'}")
+
+    print()
+    print("=" * 74)
+    print("SUMMARY")
+    print("=" * 74)
+    print(f"  tasks accepted      : {task_result['summary']['accepted']}/{task_result['summary']['total']}")
+    print(f"  edits attempted     : {harness_result['ledger']['attempted']}")
+    print(f"  edits accepted      : {harness_result['ledger']['accepted']}")
+    print(f"  score mode          : {harness_result['score_mode']}")
+    if harness_result["score_mode"] != "rollout":
+        print("  NOTE: the harness trajectory is replayed, not measured. "
+              "Run with --score rollout for the honest number.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

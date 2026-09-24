@@ -35,7 +35,17 @@ N_EVAL="${N_EVAL:-4}"
 OUT="${MULTIHARNESS_OUT:-$PWD/outputs}"
 mkdir -p "$OUT"
 
-TRAIN_TASKS="t1-01,t1-02,t1-03,t1-04,t1-05,t1-06,t1-07,t1-08,t2-01,t2-02,t2-03,t2-04,t3-01,t3-02,t3-03,t3-04"
+# Read the train split from the suite rather than repeating it here. A literal
+# copy drifts the moment a task is added: the scan would keep measuring 16 cells
+# while `suite.py` trains on 17, and nothing would fail — the extra task would
+# simply never be scanned, so `train.py` would never see its pass rate and would
+# silently include it as a zero-gradient row.
+TRAIN_TASKS="$(bash "$RUN" -c 'import sys; sys.path.insert(0, "src"); from multiharness.tasks.suite import TRAIN_TASK_IDS; print(",".join(TRAIN_TASK_IDS))')"
+if [ -z "$TRAIN_TASKS" ]; then
+  echo "FATAL: could not read TRAIN_TASK_IDS from the suite" >&2
+  exit 1
+fi
+echo "train split: $TRAIN_TASKS"
 
 banner() { printf '\n\n########## %s ##########\n\n' "$1"; }
 

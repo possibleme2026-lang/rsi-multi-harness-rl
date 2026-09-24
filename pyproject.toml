@@ -59,6 +59,16 @@ packages = ["src/multiharness"]
 line-length = 119
 target-version = "py312"
 
+# Run artifacts are excluded *by path*, not by being gitignored.
+#
+# Ruff skips files listed in .gitignore, so `outputs/` was covered by accident:
+# the moment a run was redirected with MULTIHARNESS_OUT — which the README and
+# `_bootstrap.outputs_root` both document — its directory was no longer
+# gitignored and ruff started linting the checkers the *task generator* writes,
+# reporting 12 errors in generated code that nobody should be editing. An
+# explicit exclude is what was always meant.
+exclude = ["outputs", "outputs_*", "build", "dist"]
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 

@@ -91,7 +91,31 @@ jobs:
           python tests/test_path_errors.py
           python tests/test_shell_timeout.py
           python tests/test_scan_tooling.py
+          python tests/test_verifier_modes.py
+          python tests/test_rsi_stats.py
+          python tests/test_rsi_generator.py
+          python tests/test_rsi_loop.py
           python tests/smoke_env.py
+
+  # The figures are evidence, so they are checked like evidence: decoded from
+  # the committed bytes with nothing but the standard library. A plotting bug
+  # that produces a blank canvas still writes a valid PNG of plausible size and
+  # the README would keep embedding it, so the check is on the pixels rather
+  # than on the file's existence. Stdlib-only on purpose -- a check that needed
+  # the plotting library could not catch a bug in it.
+  figures:
+    name: figures (decodable, non-degenerate)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check every committed figure
+        run: python tools/check_figures.py
 
   docs:
     name: docs (bilingual sync)

@@ -173,7 +173,37 @@ def _kill_tree(pid: int) -> None:
 
 
 def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -> str:
+    """Run one shell command in *cwd* and return its combined output.
+
+    The output-only form. Callers that need the exit status must use
+    :func:`_run_shell_rc` — see the note there on why the text is not a
+    faithful carrier of it.
+    """
+    return _run_shell_rc(command, cwd, timeout)[0]
+
+
+def _run_shell_rc(
+    command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S
+) -> tuple[str, int | None]:
     """Run one shell command in *cwd*. Non-stateful, like mini-swe-agent.
+
+    Returns ``(output, returncode)``. ``returncode`` is ``None`` when the
+    command could not be started at all or was killed by the timeout, and the
+    exit status otherwise.
+
+    Why the exit status needs its own channel
+    -----------------------------------------
+    A *silent* command is rendered as ``"(no output, exit=N)"``, so the same
+    string is produced for a success and a failure — ``exit=0`` and ``exit=1``
+    differ only in one digit buried in prose. Anything that reads the text to
+    decide whether a command succeeded is therefore parsing a human-readable
+    message as if it were a status code. ``verify``'s ``python_exit`` mode did
+    exactly that, and its check was
+    ``"[error]" not in out and "Traceback" not in out and "Error" not in out``
+    — all three of which are true for *both* ``exit=0`` and ``exit=1``. Every
+    self-generated Python verifier therefore scored 1.0 regardless of what it
+    checked, which is a silent false-positive in the one place the experiment
+    cannot afford one.
 
     Output goes to a **temporary file, never a pipe**, and stdin is
     ``DEVNULL``. Both are load-bearing, and both were learned from a live
@@ -190,7 +220,7 @@ def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -
       occasionally; ``DEVNULL`` turns an infinite hang into an instant EOF.
     """
     if BASH is None:
-        return "[error] no POSIX bash found on this host; set MULTIHARNESS_BASH"
+        return "[error] no POSIX bash found on this host; set MULTIHARNESS_BASH", None
 
     with tempfile.TemporaryFile() as sink:
         try:
@@ -208,7 +238,7 @@ def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -
                 start_new_session=True,
             )
         except OSError as exc:  # pragma: no cover - host dependent
-            return f"[error] could not run command: {exc}"
+            return f"[error] could not run command: {exc}", None
 
         timed_out = False
         try:
@@ -229,9 +259,17 @@ def _run_shell(command: str, cwd: str | Path, timeout: int = _SHELL_TIMEOUT_S) -
     out = raw.decode("utf-8", errors="replace")
     if len(out) > _MAX_OUTPUT_CHARS:
         out = out[: _MAX_OUTPUT_CHARS] + "\n... [truncated]"
+    # A timeout means the process was killed by us, so its status is not a
+    # verdict on the command: report None rather than a misleading 0.
+    rc = None if timed_out else proc.returncode
     if timed_out:
-        return f"[error] command timed out after {timeout}s\n{out}".rstrip()
-    return out if out.strip() else f"(no output, exit={proc.returncode})"
+        return f"[error] command timed out after {timeout}s\n{out}".rstrip(), rc
+    if out.strip():
+        return out, rc
+    # Silent command: surface the status in the text *as well*, because the
+    # model reads this string. The second element of the tuple is what code
+    # must branch on.
+    return f"(no output, exit={rc})", rc
 
 
 # --------------------------------------------------------------------------
@@ -284,10 +322,18 @@ def verify(task: dict, workdir: Path) -> float:
         if not script:
             return 0.0
         runner = to_bash_path(sys.executable)
-        out = _run_shell(f'"{runner}" {script}', cwd=workdir, timeout=60)
-        # _run_shell appends "(no output, exit=N)" when silent; check the file too.
-        ok = "[error]" not in out and "Traceback" not in out and "Error" not in out
-        return 1.0 if ok else 0.0
+        _out, rc = _run_shell_rc(f'"{runner}" {script}', cwd=workdir, timeout=60)
+        # The exit status is the verdict. It used to be inferred from the text
+        # ("[error]"/"Traceback"/"Error" absent), which passes for a *silent*
+        # failure as well as a success: `_run_shell` renders both as
+        # "(no output, exit=N)", so `exit=1` carried no traceback and no
+        # "[error]" and scored 1.0. Every generated Python verifier was
+        # therefore a constant-1.0 oracle. `rc` is the same value the shell
+        # itself branched on, so it cannot be fooled by how the output reads.
+        #
+        # A non-zero exit *with* output is still a failure — the check's own
+        # printed reason must not be able to buy a pass.
+        return 1.0 if rc == 0 else 0.0
 
     raise ValueError(f"unknown verify mode {mode!r}")
 

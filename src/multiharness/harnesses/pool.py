@@ -22,7 +22,7 @@ adapting. That is the cross-harness signal this experiment measures.
 
 from __future__ import annotations
 
-from .core import ANSWER_NAME, BaseHarnessEnv, _run_shell, resolve_workspace_path
+from .core import ANSWER_NAME, BaseHarnessEnv, _run_shell_rc, resolve_workspace_path
 
 # --------------------------------------------------------------------------
 # 1. bash_minimal — mini-swe-agent style: one tool, no ceremony
@@ -260,12 +260,35 @@ class CodexStyleEnv(BaseHarnessEnv):
             return f"added {rel} ({len(body)} lines)"
 
         # Fall back to `patch` if the host has it; otherwise report clearly.
-        out = _run_shell(
-            "command -v patch >/dev/null 2>&1 && patch -p0 -f <<'__PATCH__'\n"
+        #
+        # The command is built as a *pipeline* rather than by appending `|| ...`
+        # after the heredoc terminator. The previous version did the latter:
+        #
+        #     command -v patch >/dev/null 2>&1 && patch -p0 -f <<'__PATCH__'
+        #     <the patch>
+        #     __PATCH__
+        #     || echo '[error] patch tool unavailable or patch failed'
+        #
+        # A heredoc ends at its terminator, so the `||` landed on a line of its
+        # own and the whole command was a bash *syntax error* — the patch was
+        # never applied, and the model's perfectly valid unified diff came back
+        # as `syntax error near unexpected token '||'`. This is a harness defect
+        # that reads as a model failure: it is why `codex_style` scored 0/8 on
+        # every eval task in every arm. An error message that blames the tool
+        # while the tool was never invoked is worse than no fallback.
+        #
+        # `{ ... }` groups the heredoc-fed command so a single `||` can follow
+        # it legally, and the exit status is reported rather than parsed out of
+        # the text.
+        out, rc = _run_shell_rc(
+            "{ command -v patch >/dev/null 2>&1 && patch -p0 -f <<'__PATCH__'\n"
             + patch
-            + "\n__PATCH__\n|| echo '[error] patch tool unavailable or patch failed'",
+            + "\n__PATCH__\n"
+            "} || echo '[error] patch tool unavailable or patch failed'",
             cwd=self._workdir,
         )
+        if rc == 0 and "error" not in out.lower():
+            return out or "patch applied (no output)"
         return out
 
 

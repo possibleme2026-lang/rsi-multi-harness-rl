@@ -1,36 +1,315 @@
 # rsi-multi-harness-rl
 
-**面向 agentic RL 的跨 harness 泛化。**
+**面向 agentic RL 的递归自我改进：任务、奖励、harness 三者都由系统自己构建，再由会失败的闸门逐一把关。**
 
-让同一个策略在多种 agent harness 中训练，再测量它有多少能迁移到一个从未见过的 harness 上。
+策略是在某个 *agent harness* 内部训练的。本仓库要问的是：当 harness 不再是一个训练之后才
+拍板的产品决策——当系统**自己生成任务、自己写奖励函数、自己演化 harness**，并且只保留那些
+增益超过实测噪声底线的改动时，会发生什么。
 
-> **当前状态：基础设施完成，主实验尚未运行。**
-> 本仓库交付的是一套经过验证的测量装置和一份预注册的协议。跨 harness gap 的数字
-> **待补**，原因是实测出来的而非假设的——扫描到的训练单元格中有 52% 不含任何梯度。
-> 见[实验结果](#实验结果)。
+这里有三个轴是自构建的，每一个都是被验证出来的，而不是被断言的：
+
+| 轴 | 由谁构建 | 由谁把关 | 证据 |
+| --- | --- | --- | --- |
+| **任务** | `rsi/task_gen.py` | 闸门 V1–V4 | `outputs/rsi/validation.json` |
+| **奖励** | `rsi/verifier_gen.py` | V1 永不触发 / V2 总是触发 | 同一产物，按闸门分列 |
+| **harness** | `rsi/harness_evolve.py` | 噪声底线 + 工具面守卫 | `outputs/rsi/ledger.jsonl` |
 
 [English](README.md)
 
 ---
 
-## 问题
+## 为什么这才是难点
 
-一个 agentic 策略是在某个 *harness* 内部训练的：一段 system prompt、一组工具、一套
-提交协议。通常人们把 harness 当成训练之后的产品决策——先把模型训好，再套上 Claude
-Code，或者 Codex，或者自己写的脚手架。
+一个 agentic 策略是在某个 *harness* 内部训练的：一段 system prompt、一组工具、一套提交协议。
+通常人们把 harness 当成训练之后的产品决策——先把模型训好，再套上 Claude Code，或者 Codex，
+或者自己写的脚手架。
 
 这个视角掩盖了一种失败模式。如果一个策略只在一个 harness 里训练过，它可以靠记住那个
-harness 的接口来满足奖励，而不是靠理解任务本身。奖励上升了，能力没有迁移。然后脚手架
-一换，策略就得重训。
+harness 的接口来满足奖励，而不是靠理解任务本身。奖励上升了，能力没有迁移。然后脚手架一换，
+策略就得重训。
 
-小米的 MiMo-V2.6 技术报告直接把这一点讲了出来。§4.2.5 采用多 harness 训练，理由是开源
-用户会各自搭建自己的 harness、而不会收敛到同一个；发布说明则指出多 harness 训练提升了
+小米的 MiMo-V2.6 技术报告直接把这一点讲了出来。§4.2.5 采用多 harness 训练，理由是开源用户会
+各自搭建自己的 harness、而不会收敛到同一个；发布说明则指出多 harness 训练提升了
 *"the model's generalization ability across different frameworks, including unseen ones"*。
 报告的效果：把 harness 换成训练中从未见过的那些（Codex、Claude Code、mini-swe-agent），
 平均通过率从约 50% 升到 66%。
 
-本仓库是这个实验的一个小型、可完整复现的实例。一块笔记本 GPU、一个 0.5B 模型、一套小到
-可以逐条人工检查的任务集——但测量方法做扎实。
+要在一块笔记本 GPU 上复现它，得先解决一个前置问题：**固定的任务集和手写的奖励回答不了关于
+泛化性的问题**，因为任务集恰好覆盖到什么，就会被测成什么。所以本仓库自己造课程、自己造奖励、
+自己造脚手架——然后想尽办法去证伪它们。
+
+## 轴一 —— 任务是生成的，不是维护出来的
+
+`rsi/task_gen.py` 从一个显式参数空间采样，产出一次完整的试验：环境、任务、奖励，以及一份
+参考解法。
+
+| 参数 | 取值 | 它控制什么 |
+| --- | --- | --- |
+| `tier` | T1 / T2 / T3 / T4 | 难度族 |
+| `payload_len` | 1、2、4、8、16 | 有多少文本必须完整走完一个来回 |
+| `escape_density` | 0.0、0.15、0.35、0.6 | 需要多少 shell 转义 |
+| `steps` | 1、2、3 | 写出去之前要经过几步变换 |
+| `read_source` | false、true | 内容在 prompt 里，还是在磁盘上 |
+| `verify_mode` | `file_equals` / `file_contains` / `python_exit` | 结果怎么判分 |
+
+这里每个函数都是"参数 + 种子"的纯函数，所以同一个种子会产出逐字节一致的任务。这正是 CI 能
+重新推导整套任务、并与真正拿来训练的那个产物逐条比对的前提。
+
+**手写的"简单层"试过，被否掉了。** 本工作最早的设计是加一层手写的 T2-lite 简单任务，去填补
+扫描发现为空的那些单元格。手写一层等于让人来维护课程，而这恰恰是 RSI 要取代的东西。生成器用
+参数就能产出同样的覆盖度，并且可以按需产出更多。
+
+## 轴二 —— 奖励是生成的，而且它会以两种方式出错
+
+`rsi/verifier_gen.py` 把一个期望答案变成一个奖励。生成出来的奖励只有两种失败方式，两种都是
+闸门而不是评审意见：
+
+* **它永不触发**——参考解法拿不到 1.0，于是任务无解，每一条 rollout 都被浪费（闸门 **V1**）；
+* **它总是触发**——空目录也能拿到 1.0，于是任务什么都没测，策略学会了"什么都不交"（闸门 **V2**）。
+
+第三种情况更微妙，它靠构造而不是靠闸门解决。`check_script` 是一个**文件名**，不是源码：
+`core.verify` 会以工作目录为 cwd 执行 `python <check_script>`，而把文件放进那个目录的唯一
+机制是 `setup`。这就把检查脚本放进了 agent 伸手可及的范围内，所以生成出来的检查脚本存的是
+**SHA-256**，而不是明文答案。这又意味着**子串奖励不能做成摘要**——判断包含关系需要那个 needle
+本身——所以它落在 `file_contains` 模式里，比较发生在 harness 进程内，磁盘上什么都不写。
+`check_script_source` 遇到这种情况会直接抛错，而不是产出一个根本不可能工作的检查脚本：
+
+| 强度 | 模式 | 原因 |
+| --- | --- | --- |
+| `exact` | `file_equals` | 比较在进程内完成，沙箱里什么都不进 |
+| `normalised` | `python_exit` | 需要断言一个性质，而不是一个字符串 |
+| `substring` | `file_contains` | **摘要无法判断包含关系** |
+
+而且，短答案用 `python_exit` 判分会把可暴力破解的摘要送出去，所以生成器会去咨询
+`recommend_mode`，而不是相信自己手里的参数向量。在一条 300 任务的批次上，这条规则接上之前
+有 96 条（32%）属于这种情况；现在是 0 条，同时长答案的 `python_exit` 依然可达。
+
+## 轴三 —— harness 被演化，对照一条实测的噪声底线
+
+`rsi/harness_evolve.py` 在一个由八个具名描述符改动构成的编辑空间里搜索，每一条都是一个
+*关于"策略为什么失败"的假设*：
+
+| 改动 | 组件 | 假设 |
+| --- | --- | --- |
+| `guidance+=submit_echo` | prompt | 写出了文件，但从不核对内容 |
+| `guidance+=retry_hint` | prompt | 一次调用失败后就停下 |
+| `guidance+=exactness` | prompt | 在需要精确匹配的答案后面加了话 |
+| `guidance+=one_line` | prompt | 要的是一个值，它写了一个句子 |
+| `prompt-=verbose_preamble` | prompt | 要求推理的引导把轮次预算花在了散文上 |
+| `output_plumbing+=explicit_path` | output_plumbing | 写到了错误路径或嵌套目录里 |
+| `client_tool-=read_file` | client_tool | 用不上的工具占上下文，还招来乱调用 |
+| `context_mgmt+=keep_last_error` | context_mgmt | 重复一次已经失败过的调用 |
+
+四条设计约定让它成为一次搜索，而不是一次随机游走：
+
+**候选必须比在位者高出噪声底线以上。** 底线是 `z · √2 · se`，`z = 2`，跨单元格池化，改写自
+RRSI 的 `calibrate.py`。没有它，演化循环会永远在采样误差上爬坡。账本把
+`rejected_within_noise` 与 `rejected_worse` 分开记——这个区分很重要，因为"我们分辨不出来"和
+"它更差"是两个不同的发现。
+
+**编辑预算做退火。** `b_t = ceil(b_min + (b_max − b_min)·½(1 + cos(πt/T)))` 约束的是
+`‖z_t‖₀`，也就是一次提案里独立改动的条数。它不是步长，也不是分数阈值。当
+`T=12, b_min=1, b_max=3` 时，这条调度是 `[3,3,3,3,3,3,2,2,2,2,2,2,1]`。
+
+**新颖度只数结构性组件。** 一个 harness 的引导文字被改写五次，不等于它探索了五个区域；把这算
+成新颖度，只会推着循环继续改写散文，而不是去改接口。这里的"结构性"指 `client_tool` 和
+`output_plumbing`——改变 agent **能做什么**的组件，而不是改变它**被告知什么**的组件。
+
+**每一次尝试都记录，剪枝只看零产出。** RRSI 每条被接受的改动记一条，其余靠轨迹反推。这里的
+编辑空间很小，所以被拒记录承载的信息比例更高："这一整片邻域已经穷尽"只有在失败也进了账本时
+才看得见。一个组件只有在被尝试至少 `min_attempts` 次**且从未被接受过一次**时才会被剪掉——
+用产出率阈值会误杀偶尔有效的组件，而这恰恰是统计层存在的意义所在。
+
+产物是一份 JSONL 账本，它是对每个假设的检验而不是一个分数：尝试 30 次改动、接受 10 次，并且
+`context_mgmt` 因为历次尝试零产出而被剪掉。
+
+**这些数字来自 `--score ledger-replay`，产物本身也这么标注。** `scripts/rsi_loop.py` 有两种评分
+模式，区别记录在 `outputs/rsi/harness.json` 的 `score_mode` 字段里：
+
+| 模式 | 谁给候选打分 | 这个数字意味着什么 |
+| --- | --- | --- |
+| `ledger-replay` | 一个确定性的替身函数 | 在**不需要 GPU** 的前提下走遍预算、守卫、噪声地板、账本与剪枝规则 |
+| `rollout` | 模型，在任务批次上 rollout | 诚实的 harness 数字 |
+
+replay 模式的存在，是为了让循环的机械结构能在 CI 跑的那台机器上被运行和测试——那台机器没有
+GPU。它**不是**模型测量，把轨迹 `[0.471, 0.528, 0.528, …]` 读成"harness 变好了"是错的：那是一条
+合成曲线，唯一职责是走到循环的每个分支。`rollout` 那条臂还没跑；跑完之后同一个产物里装的就是
+真实数字，`score_mode` 也随之改变。replay 产物里的噪声地板被标为 `fixed fallback` 出于同样的
+理由——每个状态只有一个分数，支撑不起 bootstrap 地板。
+
+## 四道闸门，以及为什么是四道
+
+一个生成出来的任务，只有过了全部四道才被信任。它们被施加在**每一个**任务、每一次运行上，
+而不是靠约定来断言。
+
+| 闸门 | 问题 | 它抓什么 |
+| --- | --- | --- |
+| **V1** oracle | 参考解法能拿到 1.0 吗？ | 任务规格错误 |
+| **V2** nop | 空目录能拿到 0.0 吗？ | 总是触发的奖励 |
+| **V3** safety | `check_script` 真的随 `setup` 发出去了吗？ | 判分时根本不存在的检查脚本 |
+| **V4** cross-harness | 在**每一个**可训练 harness 上都可解，且它们之间**不完全相同**吗？ | 一个在测 harness 完备性的任务，或一个不含 harness 轴信息的任务 |
+
+**V4 是两个参考系统都不需要的闸门**，而它正是本仓库存在的理由。RRSI 是在一个*固定*任务集上
+演化 harness；SPADE 是在一个*固定* agent 上生成环境。同时变动两者，就同时逼出两个条件：一个
+任务必须在全部四个可训练 harness 上可解，否则某个单元格上的低分测的是那个 harness 的完备性、
+而不是策略的能力；同时它**不能**在所有 harness 上得分完全相同，否则它不含被测那条轴的信息。
+
+在一条 30 任务的生成批次上实测：**接受 30，拒绝 0**，其中 T1 13、T2 6、T3 3、T4 8——19 个任务
+带源文件，模式分布为 `file_equals` 17 / `file_contains` 12 / `python_exit` 1。
+
+该批次的参数向量**请求**的是 `file_equals` 10 / `file_contains` 12 / `python_exit` 8。两个分布
+相差 **7 次覆盖**，而这个落差正是下文那个"可暴力破解的摘要"缺陷的修复：每一个被降级的任务，
+都是在短到无法安全摘要的答案上请求了 `python_exit`，而生成器现在会去问 `recommend_mode`，
+不再相信自己抽出来的参数向量。产物把两个计数并排记录下来，正是为了让这个落差始终可见——
+只给一张"实际使用的模式"表，会把产生它的那次修正一起藏掉。
+
+## 测量上的设计约定
+
+**verifier 与 harness 无关。** 判分只读 `<workdir>/answer.txt`。判分器无法知道一份答案是哪个
+脚手架产出的，所以分数差异不可能来自判分环节。各 harness 的区别在于答案**怎么提交**——
+`react_tools` 有 `finish` 工具，`json_strict` 有 `submit`——一个只学会"用 bash 写文件"的模型
+不做出适配就无法在这些 harness 上得分。这正是被测的信号。
+
+**harness 之间是结构性差异，不是装饰性差异。** 五个 harness，在工具集和提交协议上不同：
+
+| harness | 工具 | 提交方式 | 角色 |
+| --- | --- | --- | --- |
+| `bash_minimal` | `bash` | 写文件 | 训练 |
+| `react_tools` | `bash`、`read_file`、`write_file`、`finish` | `finish()` 工具 | 训练 |
+| `json_strict` | `bash`、`submit` | `submit()` 工具 | 训练 |
+| `longctx_summary` | `bash`、`read_file`、`replace_in_file` | 写文件 | 训练 |
+| `codex_style` | `bash`、`apply_patch` | 写文件 | **留出** |
+
+**被留出的是两条轴，不是一条。** 只切分 harness 会让模型背下任务却仍显得"泛化了"；只切分任务
+则让 harness 这条轴完全没被检验。所以任务集按 16/8 切分，而 `codex_style` 从头到尾不出现在
+训练里。
+
+**能力探测把住 GPU 花费这道关。** 训练之前，四道门先确认基座模型能否驱动这套 harness。
+如果不能，之后测出的任何 gap 都是噪声，诚实的输出是"没有结论"而不是一个数字。
+
+| 门 | 阈值 | 实测（n=32） | 判定 |
+| --- | --- | --- | --- |
+| G1 tool-call 率 | ≥ 50% | 2,048 条 rollout 中 **77.3%** | 通过 |
+| G2 可达单元格（pass@32） | ≥ 1 | **64 个中 42 个** | 通过 |
+| G3 跨 harness 差值 | > 0 | **0.72** | 通过 |
+| G4 多轮采纳率 | ≥ 50% | 1,584 条调用工具的 rollout 中 **100%** | 通过 |
+
+**Go/No-Go：GO。** Qwen2.5-0.5B-Instruct 能驱动全部五个 harness。平均轮数 1.78，平均工具调用
+1.04 次。
+
+## 测量实际发现了什么
+
+主消融现在已经跑过了——数字，以及它为什么比协议设计时要解决的问题更少，见下文**结果**一节。
+这里测出来的是它的前置条件，而这个前置条件推翻了本文件早先的一个说法。
+
+本仓库早先的一个版本报告过：**"64 个单元格里有 33 个（52%）是死的"**，以及
+**"T2 在全部 16 个单元格上都是死的"**。这两个数字都来自一次 n=8 的扫描。在 n=32 上重跑同样的
+单元格、rollout 数翻四倍之后，说明它们是欠测量的产物，而不是一个发现。
+
+| | n=8 | n=32 |
+| --- | --- | --- |
+| 可判为 **live** 的单元格 | 0 | **31** |
+| 可证明为 **dead** 的单元格 | **0** | **0** |
+| **欠测量** 的单元格 | 64 | 33 |
+| 因证据太薄被丢弃的单元格 | 33 | 29 |
+| 平均 GRPO 组信号 | 0.419 | 0.491 |
+| 分层：frontier / unresolved | 11 / 53 | 23 / 41 |
+
+**在 n=8 时，64 个单元格里没有一个可分类。在 n=32 时，依然没有一个单元格可以被证明是死的。**
+旧的"52% 是死的"其实是 33 个被点估计过滤器丢掉的单元格，而被丢掉不等于死。
+
+把算术写下来就不微妙了。在 `G` 次生成、通过概率 `p` 的条件下，一个组**不含**梯度的概率是
+`p^G + (1−p)^G`。当 `p = 0.05, G = 8` 时它是 **0.6634**——也就是说仍有 **33.66%** 的组带梯度。
+只有 `p = 0` 和 `p = 1` 是可证明死掉的。观测到的 `0/8`，其 95% 上界是 **0.312**（精确形式
+rule of three，`1 − (1−c)^(1/n)`；大家更熟的 `3/n` 给出 0.375，那是大样本近似），而一个真实
+通过率为 0.30 的单元格，大约有 5.8% 的概率表现为 `0/8`。
+
+**随后训练证实的是这条算术，而不是那个过滤器。** 单 harness 臂——64 步、全部 16 行保留、丢弃
+0 行——记录的 `frac_reward_zero_std` 均值为 **0.617**，其中 **64 步里有 26 步**恰好等于 1.0
+（完全无梯度）。若每一行都落在信号带下沿，公式预测 0.6634；实测的 0.617 就是这个量在一次真实
+运行上的取值。按旧过滤器，预期会得到一次几乎全死的运行——它把 16 行里的 8 行丢掉了——而实测
+59% 的步带梯度，正是那个过滤器会扔掉的东西。
+
+所以判定是三值的，而中间那个值才是诚实的那个：
+
+* **`DEAD`**——置信区间完全落在信号带 `[0.05, 0.95]` 之外。零通过时需要 **n ≥ 73**；观测到一次
+  通过则需要 n ≥ 110。
+* **`LIVE`**——区间被包含在带内，**并且**宽度不到带的一半。只满足包含是不够的：`1/2` 给出
+  `[0.09, 0.91]`，它确实被包含在一条 0.90 宽的带里，却什么都没定位到。当 `p = 0.5` 时，第一个
+  满足宽度上限的 `n` 是 **16**（`8/16` 过，`7/15` 不过）。
+* **`UNDER_MEASURED`**——其余全部；在 n=8 时就是全部。
+
+用 Wilson 区间而不是 Wald，因为 Wald 在零通过时退化成 `[0, 0]`——恰好制造出我们正要消除的
+那种虚假确定性。Wilson 在 `n=8` 时围绕收缩估计 `(z²/2)/(n+z²) = 0.1622`（而不是 0）居中，
+给出上界 **0.3244**。
+
+n=32 的矩阵在**两个方向**上推翻了 n=8 的个别读数，这是旧数字属于噪声的最清楚证据：
+
+| 单元格 | n=8 | n=32 | 旧读数是什么 |
+| --- | --- | --- | --- |
+| `bash_minimal` × t1-04 | 1/8 = 0.125 | **1/32 = 0.031** | 大致对了，确实接近死 |
+| `bash_minimal` × t1-08 | 2/8 = 0.250 | **22/32 = 0.688** | 被严重低估 |
+| `react_tools` × t1-08 | 0/8 = 0.000 | **3/32 = 0.094** | 被读成"死"——其实只是罕见 |
+| `longctx_summary` × t1-08 | 0/8 = 0.000 | **6/32 = 0.188** | 被读成"死"——其实只是罕见 |
+
+n=32 下按层：**T1** live 26、dead 0、欠测量 6；**T2** live 0、dead 0、欠测量 16；**T3** live 5、
+dead 0、欠测量 11。
+
+**T2 依然是真问题，而现在它是一个被测量过的问题。** 四个 harness 在四个 T2 任务上全部得
+0/32——16 个单元格里 15 个恰好为零，第 16 个是 1/32——所以 0.5B 模型无法足够可靠地完成"两步
+读取再抽取"的流水线，以至于从未通过。这是一致的**能力**失败，而不是 harness 差异。**不能**
+支持的是把它叫做死：在 n=32 时 `0/32` 的区间是 `[0, 0.107]`，而一个真实通过率为 0.10 的单元格
+在 57% 的 GRPO 组里仍然带信号。
+
+**结论，直说。** T2 的解法是任务生成器，不是手写一个更简单的层：T2 的失败是难度标定问题，
+而参数空间能移动它，`rsi/band.py` 里的 `steer` 已经在返回这个覆盖值了。消融应当跑在一套重新
+生成的、其 frontier 单元格确实落在 frontier 上的任务集上——这正是分层的作用。
+
+## 图表
+
+全部十三张都由 `./run.sh tools/plot.py` 从记录下来的产物重新生成，每一张都在 CI 里被校验：
+只用标准库去解码提交进仓库的 PNG 字节——一个画出空白画布的绘图 bug 依然会写出尺寸合理、格式
+合法的 PNG，所以检查的是像素，而不是文件是否存在。
+
+**扫描结果，以及为什么 n=8 不够。**
+
+![通过率矩阵](docs/figures/fig01_scan_matrix.png)
+
+![每个单元格的 Wilson 区间](docs/figures/fig02_measurement.png)
+
+**判定分布（旧样本量对新样本量），以及说明"死"到底该是什么意思的解析信号曲线。**
+
+![判定计数](docs/figures/fig03_verdicts.png)
+
+![GRPO 组信号概率](docs/figures/fig04_grpo_signal.png)
+
+**每个单元格在难度曲线上的位置，以及那些零背后的机制。**
+
+![难度分层](docs/figures/fig05_bands.png)
+
+![rollout 为什么停下](docs/figures/fig06_stop_reasons.png)
+
+**轮次与工具调用行为，按结果和按层拆分。**
+
+![轮次与工具调用](docs/figures/fig07_turns.png)
+
+![工具调用对奖励](docs/figures/fig08_toolcall_reward.png)
+
+**两张解析图——退火编辑预算，以及 harness 演化账本。**
+
+![退火编辑预算](docs/figures/fig09_edit_budget.png)
+
+![harness 演化账本](docs/figures/fig10_ledger.png)
+
+**两个自构建轴：生成批次上的闸门结果，以及标出零梯度步的训练曲线。**
+
+![四闸门验证](docs/figures/fig11_validation.png)
+
+![训练曲线](docs/figures/fig12_training.png)
+
+**结果本身——三条臂，以及各自留下的 gap。**
+
+![消融](docs/figures/fig13_ablation.png)
 
 ## 测量方法
 
@@ -52,90 +331,82 @@ gap = mean(reward | train harnesses) − mean(reward | held-out harness)
 消融是 `single` 对 `multi`，两者都对照 `baseline` 来读。一个不带 baseline 臂的原始 gap
 数字只是一个水平值，不是结论。
 
-被留出的是两条轴，不是一条。只切分 harness 会让模型背下任务却仍显得"泛化了"；只切分任务
-则让 harness 这条轴完全没被检验。所以任务集按 16/8 切分，而 `codex_style` 从头到尾不出现在
-训练里。
+**两条训练臂按优化步数对齐，而不是按 epoch 对齐，这个选择是有影响的。** `single` 看到 16 行，
+`multi` 看到 64 行——同样 16 个任务叉乘四个 harness——所以按 epoch 对齐会让 `multi` 拿到四倍的
+梯度更新，于是 gap 上的任何差异都会和训练预算的差异混在一起。因此两条臂跑相同的 `--steps`，
+`multi` 每个 epoch 看一次的行数相当于 `single` 的四分之一。这个比较问的是"相同算力、不同的
+环境多样性"，而这正是实验要问的问题；另一种做法回答的是"训练更久是否有帮助"，那不是本实验的
+问题。
 
-## 设计取舍
+## 结果
 
-真正起作用的是四个决定。每一个的存在都是因为"天真的写法"给出过错误答案。
+同一个进程、同一个种子（42）、共享 harness 实例，5 个 harness × 8 个留出任务 × 4 次 rollout =
+**每条臂 160 次 rollout，合计 480 次**。每个单元格 `n = 4`。
 
-**verifier 与 harness 无关。** 判分只读 `<workdir>/answer.txt`。判分器无法知道一份答案是哪个
-脚手架产出的，所以分数差异不可能来自判分环节。各 harness 的区别在于答案**怎么提交**——
-`react_tools` 有 `finish` 工具，`json_strict` 有 `submit`——一个只学会"用 bash 写文件"的模型
-不做出适配就无法在这些 harness 上得分。这正是被测的信号。
-
-**harness 之间是结构性差异，不是装饰性差异。** 五个 harness，在工具集和提交协议上不同：
-
-| harness | 工具 | 提交方式 | 角色 |
+| 臂 | train harness reward | held-out reward | gap |
 | --- | --- | --- | --- |
-| `bash_minimal` | `bash` | 写文件 | 训练 |
-| `react_tools` | `bash`、`read_file`、`write_file`、`finish` | `finish()` 工具 | 训练 |
-| `json_strict` | `bash`、`submit` | `submit()` 工具 | 训练 |
-| `longctx_summary` | `bash`、`read_file`、`replace_in_file` | 写文件 | 训练 |
-| `codex_style` | `bash`、`apply_patch` | 写文件 | **留出** |
+| baseline（不训练） | 18/128 = **0.1406** | 0/32 = 0.0000 | **+0.1406** |
+| `train-single-s64` | 34/128 = **0.2656** | 0/32 = 0.0000 | **+0.2656** |
+| `train-multi-s64` | 39/128 = **0.3047** | 0/32 = 0.0000 | **+0.3047** |
 
-**死单元格要测出来，不能拿来训练。** 当一个组内所有 rollout 得分相同时，二值奖励没有梯度。
-在 `G` 次生成、通过概率 `p` 的条件下，一个组不含信号的概率是 `p^G + (1−p)^G`——所以
-`p ≤ 0.05` 或 `p ≥ 0.95` 的单元格是可证明的浪费。pipeline 用一次难度扫描测出每个单元格，
-并在训练前丢掉死掉的那些。这是前置条件，不是优化项。
+**训练是有效的，在它见过的那些 harness 上。** 两条臂在 train harness 上都超过 baseline，而且效应
+大于抽样噪声：single `d = +0.1250`、`z = +2.49`；multi `d = +0.1641`、`z = +3.15`。single 臂的
+平均 reward 在 64 步的四个四分位上是 `0.367 → 0.488 → 0.520 → 0.508`，也就是说它学到了东西然后
+进入平台期，而不只是漂移。
 
-**能力探测把住 GPU 花费这道关。** 训练之前，四道门先确认基座模型能否驱动这套 harness。
-如果不能，之后测出的任何 gap 都是噪声，诚实的输出是"没有结论"而不是一个数字。
+**主对比不显著，而且算术上解释得很清楚。** `multi` 比 `single` 高 `d = +0.0391`、`z = +0.69`。
+由于 held-out 项在**每一条**臂上都等于 0，`d_gap ≡ d_train` 严格成立——gap 的差值就是 train 的
+差值，没有任何东西被减掉。所以诚实的表述是：
 
-| 门 | 阈值 | 实测 | 判定 |
-| --- | --- | --- | --- |
-| G1 tool-call 率 | ≥ 50% | **76.6%** | 通过 |
-| G2 可达单元格（pass@8） | ≥ 1 | **64 个中 32 个** | 通过 |
-| G3 跨 harness 差值 | > 0 | **0.75** | 通过 |
-| G4 多轮采纳率 | ≥ 50% | 392 条调用工具的 rollout 中 **100%** | 通过 |
+> 观测到的方向支持多 harness 训练，但在当前样本量下该效应**与零不可区分**。本仓库预先登记的
+> 假设**没有得到支持**，但也没有被证伪。
 
-**Go/No-Go：GO。** Qwen2.5-0.5B-Instruct 能驱动全部五个 harness。平均轮数 1.77。
+train 均值上的 Wilson 区间把分辨力说得很明白：baseline `[0.0908, 0.2114]`、single
+`[0.1968, 0.3482]`、multi `[0.2316, 0.3892]`。single 与 multi 在大部分区间上重叠。两个数字说明
+设计差了多少：在每条臂 `n = 128` 次 rollout 下，**最小可检测效应**是 `d ≥ 0.1572`，而观测到的效应
+是 `0.0391`——只有它的四分之一。要在观测到的效应量上达到 80% 检验力，需要**每条臂约 2,096 次
+rollout，是本次 eval 的 16 倍**，在这块 GPU 上这不是一个笔记本规模的实验。这是一句预算陈述，不是
+借口：数字就是数字，而这次运行能诚实报告的只有方向。
 
-## 实验结果
+**而且 held-out 项是一个 floor effect，所以这套协议围绕的那个指标根本无法被这次运行检验。**
+`codex_style` 在 baseline 臂上就是 0/32——未经训练的模型在它上面完全无法得分——这正是 gap 差值
+坍缩成 train 差值的原因。`0/32` 的 Wilson 区间是 `[0, 0.1072]`，判定为 `under_measured`：与
+"做不到"一致，但也与真实通过率 10% 一致。
 
-**主消融实验尚未运行。** 已测的是：n=8，4 个训练 harness × 16 个训练任务。
+原因**不是** harness。它已经修好、有回归测试，而 `codex_style` 依然读作零。重新跑一次 `diag.py`
+的完整记录说明了原因：模型发出了格式正确的 `apply_patch` 调用，然后把裸的答案字符串放进了本该是
+unified diff 的位置。
 
-通过率矩阵（行 = harness，列 = 任务）：
+```
+parsed calls : [{'function': {'name': 'apply_patch', 'arguments': {'patch': 'reward is one'}}}]
+tool apply_patch -> patch: **** Only garbage was found in the patch input.
+```
 
-| 任务 | `bash_minimal` | `react_tools` | `json_strict` | `longctx_summary` |
-| --- | --- | --- | --- | --- |
-| t1-01 | 0.875 | 0.375 | 0.750 | 0.125 |
-| t1-02 | 0.500 | 0.375 | 0.125 | 0.000 |
-| t1-03 | 0.375 | 0.625 | 0.250 | 0.250 |
-| t1-04 | 0.125 | 0.250 | 0.250 | 0.125 |
-| t1-05 | 0.750 | 0.625 | 0.250 | 0.250 |
-| t1-06 | 0.500 | 0.375 | 1.000 | 0.250 |
-| t1-07 | 0.875 | 0.375 | 0.500 | 0.125 |
-| t1-08 | 0.250 | 0.000 | 0.625 | 0.000 |
-| t2-01 … t2-04 | 0.000 | 0.000 | 0.000 | 0.000 |
-| t3-01 | 0.000 | 0.250 | 0.000 | 0.250 |
-| t3-02 | 0.000 | 0.000 | 0.000 | 0.000 |
-| t3-03 | 0.000 | 0.000 | 0.000 | 0.000 |
-| t3-04 | 0.000 | 0.125 | 0.000 | 0.000 |
+其余条件不变，`*** Add File: answer.txt\n+reward is one` 得 **1.0**，一份真正的 unified diff 得
+**1.0**；裸字符串得 0.0。所以这条留出轴测的是"一个 0.5B 模型到底能不能产出 unified diff"，这是
+关于基座模型的能力问题，而不是关于训练的泛化问题。**正确的修法是换一个基座模型本来就能驱动的
+第二个留出 harness**——否则 held-out 项会一直钉在 0，再多的 rollout 也解不开。
 
-**64 个单元格里有 33 个（52%）是死的**——通过率 ≤ 0.05 或 ≥ 0.95，因此没有梯度。分布本身
-就是结论，而且比单个数字所显示的更糟：
+**这次运行真正确立的东西，直说：**
 
-| 层 | 活单元格 | 死单元格 |
-| --- | --- | --- |
-| T1 抄写 | 28 | 4 |
-| T2 读取后写出 | **0** | **16** |
-| T3 引号压力 | 3 | 13 |
+* 在它见过的 harness 上训练，能提高这些 harness 上的 reward
+  （`z = +2.49` 与 `+3.15`——真实）；
+* multi 对 single 的效应方向与预测一致，`z = +0.69`——有提示性，不构成证据；
+* 预先登记的跨 harness 泛化检验**没有跑成**，因为它的 held-out 项是 floor effect；
+* GRPO 信号算术在真实运行上成立——见上文 `0.617` 对 `0.6634` 的对照。
 
-T2 在**全部 16 个单元格**上都是死的：0.5B 模型无法足够可靠地完成"两步读取再抽取"的流水线，
-以至于从未通过，所以没有任何 T2 单元格能产生梯度。T3 在 16 个中死了 13 个——这一层本是刻意
-设计成承重层（harness 在转义上真正分化之处），在这个模型规模下几乎完全无法测量。
+三条前进路线，按能解决的问题量排序：
 
-**结论，直说。** 在现有任务集上跑完整消融，得到的主指标会被结构性零值主导：eval 划分中的
-T2 与 T3 单元格会在每条臂上都是全零，而所谓"gap"大部分会是任务所属层级造成的假象。必须先让
-T2/T3 具备难度梯度，跨 harness gap 才有意义。这是下一步工作，也是本次发布被标注为"基础设施"
-而非"结果"的原因。
+1. **替换留出 harness**，换成一个 baseline 能驱动的，让 `gap = train − held_out` 有活的第二项。
+   便宜，且能解开协议。
+2. **给 train 对比补足检验力**（每臂约 2,096 次 rollout），如果问题就是那 0.0391 本身而不是 gap。
+3. **重新生成任务套件**，让 frontier 单元格真的落在 frontier 上——这是任务生成器的职责，见上文
+   T2 的发现。
 
 ## 复现
 
-需要 Python 3.12+，Windows 上需要 Git-Bash。核心部分——harnesses、任务、verifier、全部静态
-守卫——**不依赖第三方库**，所以下面的检查不需要装 torch。
+需要 Python 3.12+，Windows 上需要 Git-Bash。核心部分——harnesses、任务、verifier、整个 RSI
+层、全部静态守卫——**不依赖第三方库**，所以下面的检查不需要装 torch。
 
 ```bash
 git clone https://github.com/possibleme2026-lang/rsi-multi-harness-rl.git
@@ -146,7 +417,19 @@ cd rsi-multi-harness-rl
 ./run.sh tests/test_path_errors.py
 ./run.sh tests/test_shell_timeout.py
 ./run.sh tests/test_scan_tooling.py
+./run.sh tests/test_verifier_modes.py
+./run.sh tests/test_rsi_stats.py
+./run.sh tests/test_rsi_generator.py
+./run.sh tests/test_rsi_loop.py
 ./run.sh tests/smoke_env.py
+```
+
+RSI 循环本身在默认模式下不需要模型，所以生成器、四道闸门和 harness 演化全都能在 CPU 上跑：
+
+```bash
+./run.sh scripts/rsi_loop.py --rounds 6 --task-batch 30
+./run.sh tools/check_figures.py
+./run.sh tools/check_readme_i18n.py
 ```
 
 `run.sh` 是受支持的入口，不是便利脚本。它会设置 `APPDATA`、HuggingFace 缓存目录并清掉
@@ -164,12 +447,13 @@ STEPS=20 N_EVAL=4 bash pipeline.sh  # a smaller run
 SKIP_SCAN=1 bash pipeline.sh        # reuse an existing difficulty scan
 ```
 
-产物都在 `outputs/`（可用 `MULTIHARNESS_OUT` 覆盖）。在 RTX 5060 Laptop 上扫描约 7 分钟
-（每个单元格 0.8 秒）；训练和评估更长。
+产物都在 `outputs/`（可用 `MULTIHARNESS_OUT` 覆盖）。n=32 的扫描是 2,048 条 rollout；
+训练和评估更长。
 
 | 脚本 | 作用 |
 | --- | --- |
 | `scripts/probe.py` | 能力探测 + 难度扫描，写出 `scan_all.json` |
+| `scripts/rsi_loop.py` | 两条 RSI 轴：生成并验证任务、演化 harness |
 | `scripts/train.py` | 消融的一条臂（`--mode single` / `--mode multi`） |
 | `scripts/eval.py` | baseline + 两条臂在同一进程内跑，打印消融表 |
 | `scripts/diag.py` | 单个 (harness, task) 的完整未截断轨迹 |
@@ -184,18 +468,26 @@ src/multiharness/
   harnesses/core.py     BaseHarnessEnv、verifier、shell runner、路径解析器
   harnesses/pool.py     五个 harness
   tasks/suite.py        24 个任务，以及 train/eval 切分
+  rsi/task_gen.py       轴一 —— 生成任务、环境与参考解法
+  rsi/verifier_gen.py   轴二 —— 生成奖励，三种模式之一
+  rsi/validate.py       闸门 V1-V4
+  rsi/harness_evolve.py 轴三 —— 描述符改动、守卫、评判
+  rsi/ledger.py         只追加的 JSONL、退火预算、剪枝、停滞
+  rsi/stats.py          Wilson 区间、GRPO 信号、噪声底线
+  rsi/band.py           后悔分层与转向信号
   rollout.py            独立重实现的 TRL 工具调用循环
   _bootstrap.py         仓库根目录 + 产物目录
-scripts/                入口脚本（probe、train、eval、守卫）
+scripts/                入口脚本（probe、rsi_loop、train、eval、守卫）
 tests/                  smoke 测试与回归测试
-tools/                  README 双语一致性守卫
+tools/                  绘图、图表校验、README 双语一致性守卫
+docs/refs/              从 RRSI 和 Dream-RSI 借了什么、为什么
 pipeline.sh            完整运行流程，按依赖顺序
 ```
 
-## 两个值得记录的 bug
+## 值得记录的 bug
 
-两个都是"实测与预期不符"发现的，都有回归测试。写进 README 是因为它们各自会静默污染结果，
-而不是崩溃。
+每一个都是"实测与预期不符"发现的，每一个都有回归测试。写进 README 是因为它们全都会静默污染
+结果，而不是崩溃。
 
 **一个值 84 分钟空转 GPU 的 subprocess 死锁。** shell runner 用了
 `subprocess.run(capture_output=True, timeout=...)`。超时触发时它只杀掉直接子进程，然后去
@@ -212,9 +504,79 @@ harness 因为与模型毫无关系的原因而得分更低。同一次排查还
 （`/config.txt`、`/Users/qwen/...`）在 Windows 上会静默改指向工作区之外。现在所有接受路径的
 工具共用一个解析器，以与操作系统无关的报错拒绝空路径、`.`、目录目标和越界路径。
 
-第三个相关的修复：`errs_report.py` 最初会给出**假绿**结论——"没有 harness 缺陷"——而实际上
+**一个生成出来的、会把摘要送出去的奖励。** `verify_mode` 与 payload 是独立抽取的，于是生成器
+产出了"三字符答案 + `python_exit`"——正是 `verifier_gen` 自己的文档点名说错的那种组合，因为
+`check_script` 会落在 agent 的工作目录里。在 300 个任务上实测：**96 个（32%）受影响**。现在
+生成器去问 `recommend_mode`，而不是相信自己手里的参数向量；受影响数为 0，同时显式指定的长答案
+`python_exit` 依然被尊重。修好它又暴露出同一个提交里的第二个缺陷：`summarise_batch` 统计的是
+`params["verify_mode"]`，于是修复之后覆盖率报告声称有 8 个 `python_exit` 任务、而实际只有 1 个
+——现在它报告任务**实际使用**的模式，并把请求的模式并列在旁边。
+
+**一个靠猜的 `DEAD` 阈值。** `stats.py` 的文档说零通过时排除信号带"大约需要 `n >= 128`"。
+真实边界是 **73**（`wilson_interval(0, 73)[1] = 0.04999`；`n = 72` 给出 0.0506）。这个差距不是
+装饰性的：73 条 rollout 是一块笔记本就能做的扫描，128 条则是"停下来重新设计"的量级。文档现在
+同时写明两个边界，并有测试钉住它们。
+
+**`rule_of_three_upper` 用错了底数。** 它算的是 `1 − confidence^(1/n)`，在 `n=8` 时返回
+0.0064——小了 49 倍——而它自己的文档写的是 0.312。这是拿文档做算术对出来的。正确的底数是
+`1 − confidence`；之所以有测试，是因为这个笔误产出的浮点数看上去很合理。
+
+**`classify_cell` 会把 `0/32` 判成 live。** 一个 `(hi − lo) <= 0.25` 的捷径接受了任何窄区间，
+包括 `[0, 0.107]`——它确实窄，却完全在信号带之外。已改为"包含 **且** 宽度不超过带的一半"。
+
+**第三个相关修复：** `errs_report.py` 最初会给出**假绿**结论——"没有 harness 缺陷"——而实际上
 有 25–27 条原始 OS 报错躺在它的兜底分类里。现在它有明确的 OS 报错类别，并会让该次扫描判为
 无效。一个不可能失败的守卫比没有守卫更糟。
+
+**一个读起来像模型失败、实际是 harness 缺陷的问题——它让整次 eval 作废。**
+`codex_style` 的 `apply_patch` 回退路径，把
+`|| echo '[error] patch tool unavailable or patch failed'` 拼在了 heredoc 终止符**之后**：
+
+```bash
+command -v patch >/dev/null 2>&1 && patch -p0 -f <<'__PATCH__'
+<patch body>
+__PATCH__
+|| echo '[error] patch tool unavailable or patch failed'
+```
+
+heredoc 在终止符处结束，于是那个 `||` 变成了独立的一行，整条命令是一个 bash **语法错误**。
+任何真正到达 shell 的 unified diff 都返回 `syntax error near unexpected token '||'`，从未被应用。
+harness 的 `*** Add File` 捷径在日常测试里把它掩盖了——那条路径在到达 shell 之前就返回了——
+于是这个工具被声明、被注册、可达，却从来不工作。这正是 `guard_tool_surface.py` 想防住的失败，
+而且落在它看不见的地方。
+
+修法是把喂给 heredoc 的命令用 `{ ... }` 包起来，好让一个 `||` 合法地跟在后面，并从
+`_run_shell_rc` 读退出状态而不是解析文本——`python_exit` 犯过同一个错误。回归测试断言：合法 diff
+被应用、文件出现、且打过补丁的答案得 1.0。
+
+**这个缺陷是真的。但它并不是 `codex_style` 拿零分的原因，而本节初稿是这么写的。** 这个区分很重要，
+所以它被记录下来，而不是悄悄改掉。修复**之后**重跑 eval，`codex_style` 依然是**三条臂全部 0/8，
+包括 baseline**——所以语法错误不可能是原因。重新跑一次 `diag.py` 显示出真正的原因：
+
+```
+decoded      : '<tool_call>{"name": "apply_patch", "arguments": {"patch": "reward is one"}}</tool_call>'
+parsed calls : [{'function': {'name': 'apply_patch', 'arguments': {'patch': 'reward is one'}}}]
+tool apply_patch -> patch: **** Only garbage was found in the patch input.
+```
+
+模型选对了工具、也选对了参数名，然后把裸的答案字符串放进了本该是 unified diff 的位置。`patch`
+拒绝它是正确的。其余条件不变，三种载荷并排对比：
+
+| 传给 `patch` 的东西 | 结果 |
+| --- | --- |
+| `*** Add File: answer.txt\n+reward is one` | **reward 1.0** |
+| `reward is one`——模型实际发出的 | 0.0，`Only garbage was found` |
+| 一份真正的 unified diff | **reward 1.0** |
+
+提示词里确实写了 `` `apply_patch` takes a unified-diff body``。0.5B 模型照样不产出它。所以 harness
+的管线修好了，harness 也**不是**瓶颈——但留出 harness 依然读作 0/8，而这个原因与跨 harness 泛化
+毫无关系，这才是让测量作废的部分。见"结果"一节。
+
+**一个让主指标变得不可检验的 floor effect。** `codex_style` 在 **baseline** 臂上就是 0.0000，
+也就是说未经训练的模型在它上面完全无法得分。留出项被钉在 0 时，`gap = train − held_out` 只可能
+增大："多 harness 训练缩小 gap"这个说法无法被这次测量证伪，而第一次完整消融就是据此报告
+"单 harness 训练得到更小的 gap——假设不成立"的。那个结论依然不成立。这次运行真正确立了的东西在
+"结果"一节。
 
 ## 引用
 

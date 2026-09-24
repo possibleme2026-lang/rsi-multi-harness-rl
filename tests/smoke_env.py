@@ -78,7 +78,14 @@ def main() -> int:
     for t in TASKS.values():
         by_tier[t["tier"]] = by_tier.get(t["tier"], 0) + 1
     print(f"  by tier: {by_tier}")
-    check("24 tasks registered", len(TASKS) == 24, str(len(TASKS)))
+    # The count is asserted against the split, not against a literal. A literal
+    # here made the smoke test fail the moment the suite grew, which is exactly
+    # the kind of false alarm that trains people to ignore a red CI.
+    from multiharness.tasks import suite as _suite
+
+    expected = len(_suite.TRAIN_TASK_IDS) + len(_suite.EVAL_TASK_IDS)
+    check(f"{expected} tasks registered (train+eval split)", len(TASKS) == expected, str(len(TASKS)))
+    check("the split covers the suite", set(TASKS) == set(_suite.TRAIN_TASK_IDS) | set(_suite.EVAL_TASK_IDS))
     check("all three tiers present", set(by_tier) == {"T1", "T2", "T3"}, str(sorted(by_tier)))
 
     # -- 1. tool surface ---------------------------------------------------
