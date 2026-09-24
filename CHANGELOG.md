@@ -68,10 +68,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     probability, bootstrap noise floor, and the three-way cell verdict.
   - `band.py` — regret banding (`mastered` / `frontier` / `out_of_reach` /
     `unresolved`) with the steering signal.
+  - `curriculum.py` — **the call site `band.steer` never had.** GenEnv's
+    α-Curriculum Reward `exp(−β(p̂−α)²)` with `α` *derived* from this repo's own
+    GRPO signal curve rather than copied, a batch-scope difficulty filter, and a
+    regeneration plan that is auditable without re-reading the scan.
   - `ledger.py` — append-only JSONL evidence log, annealed edit budget, prune,
     stall detection.
 - **`scripts/rsi_loop.py`** — runs both axes end to end with no model required,
   so the loop is exercisable on CPU.
+- **A curriculum stage in the loop, and the two bugs it exposed.** `band.steer`
+  documented itself as "consumed by the task generator" and the README said it
+  "already returns the override", while a grep found only its definition and its
+  tests — no pipeline script ever called it. Wiring it up surfaced:
+  - **The difficulty filter disabled the steering.** GenEnv's `|p̂ − α| > k_min`
+    was applied *per task*; `mastered` is `p > 0.9` and `out_of_reach` is
+    `p < 0.1`, so every steerable cell sits ≥ 0.4 from `α = 0.5` — outside a 0.1
+    band. The filter rejected exactly the cells the rule existed to move, and the
+    first live run reported `moves: 0`. The rule now applies at batch scope, where
+    GenEnv wrote it. The arithmetic is pinned in the test.
+  - **A mismatched task-id set produced silently wrong overrides.** The shipped
+    scan measures the 24-task suite (`t1-01`); a generated batch carries hashed
+    ids (`t1-8f87ad9e`); the sets do not intersect. `steer` needs a task's
+    parameters, so a missing lookup fell back to defaults and emitted an override
+    for a task that does not exist — with nothing in the output looking wrong.
+    Now an explicit refusal, with the id overlap reported as a count.
+  - `scripts/probe.py --from-batch` and `rsi_loop.py`'s batch dump close the
+    loop: a generated batch can be written, registered, and scanned, so the
+    curriculum can steer the tasks it actually measured.
+  - **Steering needs `n = 64` per cell to become possible at all.** At `n = 32`
+    an all-pass cell has a Wilson lower bound of 0.8928, below `MASTERED_ABOVE =
+    0.9`, so it is `unresolved` and no move is produced however clear the point
+    estimate looks. A fact about the cost of the loop, pinned in the test.
 - **`tools/plot.py`** — every figure regenerated from a recorded artifact, and
   **`tools/check_figures.py`**, which validates the committed PNGs by decoding
   IDAT with nothing but `zlib`. A plotting bug that writes a blank canvas still

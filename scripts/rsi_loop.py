@@ -65,6 +65,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from multiharness._bootstrap import outputs_root  # noqa: E402
+from multiharness.rsi import curriculum as cu  # noqa: E402
 from multiharness.rsi import harness_evolve as he  # noqa: E402
 from multiharness.rsi import task_gen, validate  # noqa: E402
 from multiharness.rsi.ledger import Ledger, edit_budget  # noqa: E402
@@ -127,6 +128,169 @@ def run_task_axis(batch_size: int, seed: int, root: Path) -> dict:
         "rejected": rejected,
         "verdicts": [v.as_dict() for v in verdicts],
     }
+
+
+# --------------------------------------------------------------------------
+# the curriculum axis
+# --------------------------------------------------------------------------
+
+
+def run_curriculum_axis(
+    scan_path: Path,
+    batch: list[dict],
+    root: Path,
+    *,
+    alpha: float,
+    k_min: float,
+    max_moves: int | None,
+    apply: bool,
+) -> dict:
+    """Turn a measured scan into the next batch, and gate the result.
+
+    This is the call site ``band.steer`` never had. Before this function
+    existed, ``steer`` was reachable only from its own tests: the module
+    docstring said the task generator consumes it and the README said it
+    "already returns the override", but no script ever asked it for one. A
+    curriculum that is never executed is a claim, not a mechanism.
+
+    The scan is read from disk rather than passed in, because the honest
+    dependency is a *file*: the pass rates that justify moving a task have to
+    come from a run that happened, and accepting them as an argument would let
+    a caller pass a fabricated dict. ``source`` records the path, so a plan can
+    always be traced back to the measurement behind it.
+
+    The regenerated tasks go through the same four gates as every other task.
+    That is not ceremony — a regenerated task is exactly the case where a
+    generator bug produces something unsolvable, since it moves parameters to
+    the edge of the space (payload 16, escape 0.6, three steps), and the oracle
+    gate is what catches a reference solution that no longer works there.
+    """
+    print("=" * 74)
+    print("CURRICULUM AXIS — read the scan, move the tasks that are not teaching")
+    print("=" * 74)
+
+    if not scan_path.is_file():
+        print(f"  no scan at {scan_path} — skipping (the curriculum needs a measurement)")
+        print()
+        return {"skipped": f"no scan at {scan_path}"}
+    scan = json.loads(scan_path.read_text(encoding="utf-8"))
+    # Collapse raw rollout records into per-cell pass counts, the same way
+    # tools/plot.py does, so the plan and the figures cannot disagree about
+    # what the scan says.
+    agg: dict[tuple[str, str], dict] = {}
+    for r in scan.get("records", []):
+        key = (str(r.get("harness", "")), str(r.get("task_id", "")))
+        c = agg.setdefault(key, {"harness": key[0], "task_id": key[1], "passes": 0, "n": 0})
+        c["n"] += 1
+        c["passes"] += int(float(r.get("reward", 0.0)) >= 1.0)
+    cells = list(agg.values())
+
+    if not cells:
+        print("  the scan has no records — nothing to steer on")
+        print()
+        return {"skipped": "scan has no records"}
+
+    tasks_by_id = {t["id"]: t for t in batch}
+
+    # Whether the scan and the batch describe the *same tasks*. They need not:
+    # the scan shipped with this repository measures the 24-task suite
+    # (`t1-01`), while a generated batch carries hashed ids (`t1-8f87ad9e`), and
+    # the two sets do not intersect. When they do not, no task can be moved —
+    # `steer` moves a parameter vector, and there is no parameter vector for an
+    # id that is not in the batch.
+    #
+    # Reported as an explicit count rather than left to surface as `moves: 0`,
+    # because zero moves has several causes and they need different responses:
+    # a mismatched id set means "scan the batch you intend to steer", while
+    # every cell being frontier means "nothing to do, this batch is on target".
+    scan_ids = {str(r.get("task_id", "")) for r in scan.get("records", [])}
+    overlap = scan_ids & set(tasks_by_id)
+    id_match = bool(overlap)
+
+    plan = cu.plan_regeneration(
+        cells,
+        tasks_by_id=tasks_by_id,
+        alpha=alpha,
+        k_min=k_min,
+        source=str(scan_path),
+        max_moves=max_moves,
+    )
+
+    print(f"  scan          : {scan_path}  ({len(cells)} cells, {len(scan_ids)} task ids)")
+    print(f"  id overlap    : {len(overlap)} of {len(scan_ids)} scan ids are in the batch")
+    if not id_match:
+        print("      -> the scan measures a different task set; no task can be moved.")
+        print("         Scan the batch you intend to steer (probe.py --tasks <batch>).")
+    print(f"  alpha         : {plan.alpha}  (argmax of the GRPO signal curve at G={cu.DEFAULT_G})")
+    print(f"  signal at alpha: {plan.signal_at_target:.4f}")
+    print(f"  batch mean p  : {plan.mean_pass_rate:.4f}  -> {plan.misalignment}")
+    print(f"  moves         : {plan.move_count}  {plan.by_direction or ''}")
+    print(f"  held          : {plan.held_count}")
+    reasons: dict[str, int] = {}
+    for h in plan.held:
+        key = h["reason"].split(":")[0]
+        reasons[key] = reasons.get(key, 0) + 1
+    for k, v in sorted(reasons.items()):
+        print(f"      {k}: {v}")
+
+    result: dict = {
+        "scan": str(scan_path),
+        "id_overlap": len(overlap),
+        "scan_task_ids": len(scan_ids),
+        "ids_match_batch": id_match,
+        "plan": plan.as_dict(),
+        "applied": False,
+    }
+
+    if not id_match:
+        # Stated in the artifact, not only on stdout: a reader of
+        # curriculum.json has to be able to tell "nothing needed moving" from
+        # "nothing could be moved", and those look identical in `move_count`.
+        result["skipped"] = (
+            f"the scan measures {len(scan_ids)} task ids, none of which are in the "
+            f"batch of {len(tasks_by_id)}; no task can be steered"
+        )
+
+    if not apply:
+        print("  (plan only — pass --apply-curriculum to regenerate and gate)")
+        print()
+        return result
+
+    if not id_match:
+        print("  refusing to apply: there is nothing to apply a plan to")
+        print()
+        return result
+
+    fresh = cu.execute_plan(plan, tasks_by_id)
+    print(f"  regenerated   : {len(fresh)} tasks")
+    if fresh:
+        verdicts = validate.validate_batch(fresh, roots=root / "gates_regen")
+        summary = validate.summarise_validation(verdicts)
+        print(f"  regen accepted: {summary['accepted']}/{summary['total']}")
+        print(f"  failures      : {summary['failures_by_gate'] or 'none'}")
+        result["applied"] = True
+        result["regenerated"] = {
+            "count": len(fresh),
+            "summary": summary,
+            "coverage": task_gen.summarise_batch(fresh),
+            "rejected": [
+                {"task_id": v.task_id, "failed_gates": v.failed_gates,
+                 "details": {g.gate: g.detail for g in v.gates if not g.passed}}
+                for v in verdicts if not v.accepted
+            ],
+        }
+        # The honest limit, stated where the number is: this measures whether
+        # the regenerated tasks are *well-formed*, not whether they are better.
+        # The alignment claim needs a rescan, and until one happens this is a
+        # statement about solvability rather than about learning.
+        result["measured_effect"] = (
+            "none — the regenerated batch is gate-valid, which is a solvability "
+            "claim. Whether it moved toward alpha needs a rescan of these tasks."
+        )
+        print("  NOTE: gate-valid is not the same as better aligned. "
+              "The alignment claim needs a rescan.")
+    print()
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -373,6 +537,21 @@ def main() -> int:
     ap.add_argument("--max-new-tokens", type=int, default=192, help="matches scripts/probe.py")
     ap.add_argument("--b-min", type=int, default=1)
     ap.add_argument("--b-max", type=int, default=3)
+    # The curriculum axis. Off by default for `--apply-curriculum` because
+    # regeneration runs the four gates on a fresh batch, which is real shell
+    # work; the *plan* is always computed, because a plan that is never printed
+    # is the state this script was in before this flag existed.
+    ap.add_argument(
+        "--scan",
+        default=None,
+        help="scan artifact to steer from (default: $MULTIHARNESS_OUT/scan_all.json)",
+    )
+    ap.add_argument("--apply-curriculum", action="store_true",
+                    help="regenerate the flagged tasks and gate them, not just plan")
+    ap.add_argument("--curriculum-alpha", type=float, default=cu.DEFAULT_ALPHA)
+    ap.add_argument("--curriculum-k-min", type=float, default=cu.DEFAULT_K_MIN)
+    ap.add_argument("--curriculum-max-moves", type=int, default=8,
+                    help="cap on tasks regenerated in one round; 0 means no cap")
     args = ap.parse_args()
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -395,10 +574,41 @@ def main() -> int:
     (OUT / "validation.json").write_text(json.dumps(task_result, indent=2), encoding="utf-8")
     print(f"wrote {OUT / 'validation.json'}\n")
 
+    # The batch is generated once and shared: the curriculum steers *this*
+    # batch, and the harness axis scores against it. Generating a second batch
+    # for the harness axis would mean the two axes optimised against different
+    # task sets in the same round, and a plan naming a task id that the harness
+    # axis never saw.
+    batch = task_gen.generate_batch(args.task_batch, seed=args.seed)
+
+    # Write the batch so it can be scanned. A generated batch and the shipped
+    # suite share no task ids, so the curriculum's scan has to be a scan of
+    # *this* batch; `probe.py --from-batch` reads this file. Without it the
+    # curriculum can only ever read a scan of the shipped 16 ids, find none of
+    # them in the batch, and refuse to move anything — correct behaviour on
+    # inputs that cannot produce a result.
+    batch_path = OUT / "batch.json"
+    batch_path.write_text(json.dumps(batch, indent=2), encoding="utf-8")
+    print(f"wrote {batch_path}  ({len(batch)} tasks; scan it with "
+          f"`probe.py --from-batch {batch_path}`)\n")
+
+    scan_path = Path(args.scan) if args.scan else outputs_root() / "scan_all.json"
+    curriculum_result = run_curriculum_axis(
+        scan_path,
+        batch,
+        OUT,
+        alpha=args.curriculum_alpha,
+        k_min=args.curriculum_k_min,
+        max_moves=args.curriculum_max_moves or None,
+        apply=args.apply_curriculum,
+    )
+    (OUT / "curriculum.json").write_text(json.dumps(curriculum_result, indent=2), encoding="utf-8")
+    print(f"wrote {OUT / 'curriculum.json'}\n")
+
     harness_result = run_harness_axis(
         args.rounds,
         score_mode=args.score,
-        tasks=task_gen.generate_batch(args.task_batch, seed=args.seed),
+        tasks=batch,
         n_rollouts=args.n_rollouts,
         seed=args.seed,
         b_min=args.b_min,
@@ -416,6 +626,17 @@ def main() -> int:
     print(f"  edits attempted     : {harness_result['ledger']['attempted']}")
     print(f"  edits accepted      : {harness_result['ledger']['accepted']}")
     print(f"  score mode          : {harness_result['score_mode']}")
+    if "plan" not in curriculum_result:
+        print(f"  curriculum          : skipped ({curriculum_result['skipped']})")
+    else:
+        p = curriculum_result["plan"]
+        print(f"  curriculum moves    : {p['move_count']} {p['by_direction'] or ''}")
+        print(f"  curriculum held     : {p['held_count']}")
+        if not curriculum_result.get("ids_match_batch", True):
+            print(f"  curriculum ids      : MISMATCH — {curriculum_result['skipped']}")
+        if curriculum_result.get("applied"):
+            r = curriculum_result["regenerated"]
+            print(f"  regenerated accepted: {r['summary']['accepted']}/{r['summary']['total']}")
     if harness_result["score_mode"] != "rollout":
         print("  NOTE: the harness trajectory is replayed, not measured. "
               "Run with --score rollout for the honest number.")

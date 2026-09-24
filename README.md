@@ -365,9 +365,31 @@ carries signal in 57% of GRPO groups.
 
 **Consequence, stated plainly.** The task generator is the fix for T2, not a
 hand-written easier tier: T2's failure is a difficulty calibration that the
-parameter space can move, and `steer` in `rsi/band.py` already returns the
-override. The ablation should be run against a regenerated suite whose frontier
-cells are actually on the frontier — which is what the banding is for.
+parameter space can move. The ablation should be run against a regenerated suite
+whose frontier cells are actually on the frontier — which is what the banding is
+for.
+
+**And a correction.** An earlier release of this file said `steer` in
+`rsi/band.py` "already returns the override", implying the curriculum was
+closed. It was not: `steer` was reachable only from its own tests, and no
+pipeline script ever called it. The mechanism existed, was tested, and was never
+executed — the same pattern this repository keeps catching in itself. It is
+wired up now, in `rsi/curriculum.py` and stage 3 of `pipeline.sh`, and doing so
+exposed two bugs that the missing call site had been hiding:
+
+* the difficulty filter was applied per task, where it rejects every cell the
+  steering rule exists to move (`mastered` and `out_of_reach` are both ≥ 0.4 from
+  `α = 0.5`, outside a 0.1 band), so the curriculum would have produced zero
+  moves forever;
+* the scan and the generated batch share no task ids, so every parameter lookup
+  missed and `steer` would have emitted overrides derived from its own defaults —
+  a silently wrong plan with nothing in the output looking wrong.
+
+One cost is worth stating before anyone expects a regenerated suite soon:
+**steering needs `n = 64` rollouts per cell to fire at all.** At `n = 32` an
+all-pass cell has a Wilson lower bound of 0.8928, just below `MASTERED_ABOVE =
+0.9`, so it resolves to `unresolved` and produces no move however clear its point
+estimate looks. The scan that produced the table above is `n = 32`.
 
 ## Figures
 
@@ -625,12 +647,14 @@ src/multiharness/
   rsi/ledger.py         append-only JSONL, annealed budget, prune, stall
   rsi/stats.py          Wilson intervals, GRPO signal, noise floor
   rsi/band.py           regret banding and the steering signal
+  rsi/curriculum.py     the alpha-reward, and the plan that closes the loop
   rollout.py            a standalone re-implementation of TRL's tool-calling loop
   _bootstrap.py         repo root + artifact directory
 scripts/                entry points (probe, rsi_loop, train, eval, guards)
 tests/                  smoke tests and regression tests
 tools/                  plotting, figure check, README i18n parity guard
-docs/refs/              what was borrowed from RRSI and Dream-RSI, and why
+docs/refs/              what was borrowed from RRSI, Dream-RSI, and the
+                        environment-synthesis literature, and why
 pipeline.sh             the full run, in dependency order
 ```
 

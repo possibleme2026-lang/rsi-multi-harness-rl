@@ -13,9 +13,11 @@
 #   1. smokes          correctness gates; abort before any GPU time
 #   2. scan            measures pass rates for every (harness, task) cell,
 #                      which train.py needs to drop zero-gradient rows
-#   3. train single    baseline arm: one harness, free to overfit it
-#   4. train multi     treatment arm: four harnesses, cannot
-#   5. eval            baseline + both arms, on held-out tasks AND the
+#   3. curriculum      reads the scan and plans which tasks to move; with
+#                      APPLY_CURRICULUM=1 it regenerates them and gates them
+#   4. train single    baseline arm: one harness, free to overfit it
+#   5. train multi     treatment arm: four harnesses, cannot
+#   6. eval            baseline + both arms, on held-out tasks AND the
 #                      held-out harness, then prints the ablation
 #
 # Usage:
@@ -23,6 +25,13 @@
 #   STEPS=20 N_EVAL=4 bash pipeline.sh
 #   SKIP_SCAN=1 bash pipeline.sh          # reuse an existing scan
 #   SKIP_TRAIN=1 bash pipeline.sh         # re-evaluate existing checkpoints
+#   APPLY_CURRICULUM=1 bash pipeline.sh   # also regenerate the flagged tasks
+#
+# The curriculum stage plans by default and regenerates only on request,
+# because regeneration runs the four gates on a fresh batch and that is real
+# shell work. The *plan* is always produced: a steering rule that is computed
+# and never reported is indistinguishable from one that does not exist, which
+# is what this stage was added to fix.
 
 set -euo pipefail
 
@@ -49,21 +58,21 @@ echo "train split: $TRAIN_TASKS"
 
 banner() { printf '\n\n########## %s ##########\n\n' "$1"; }
 
-banner "STAGE 0/5  static guards (no model, no GPU)"
+banner "STAGE 0/6  static guards (no model, no GPU)"
 # Tool-surface guard first: it is the cheapest check and it protects the
 # meaning of every number downstream. A harness whose GUIDANCE advertises a
 # tool it never implemented scores low for a reason that has nothing to do
 # with the model — and that would be read as a capability result.
 bash "$RUN" scripts/guard_tool_surface.py
 
-banner "STAGE 1/5  correctness gates (no model)"
+banner "STAGE 1/6  correctness gates (no model)"
 bash "$RUN" tests/test_path_errors.py
 bash "$RUN" tests/test_shell_timeout.py
 bash "$RUN" tests/test_scan_tooling.py
 bash "$RUN" tests/smoke_env.py
 bash "$RUN" tests/smoke_trl.py
 
-banner "STAGE 2/5  difficulty scan (${N_SCAN} rollouts/cell, 4 harnesses x 16 tasks)"
+banner "STAGE 2/6  difficulty scan (${N_SCAN} rollouts/cell, 4 harnesses x 16 tasks)"
 if [ "${SKIP_SCAN:-0}" = "1" ] && [ -f "$OUT/scan_all.json" ]; then
   echo "SKIP_SCAN=1 and $OUT/scan_all.json exists -> reusing it"
 else
@@ -71,13 +80,33 @@ else
     --n "$N_SCAN" --tasks "$TRAIN_TASKS" --out "$OUT/scan_all.json"
 fi
 
+banner "STAGE 3/6  curriculum — read the scan, plan the moves"
+# `rsi_loop.py` generates its own batch and writes it to $OUT/rsi/batch.json,
+# then plans against whatever scan it is pointed at. The default scan
+# ($OUT/scan_all.json) measures the *shipped* 24-task suite, which shares no
+# ids with a generated batch, so the plan will correctly report zero moves and
+# say why. That is not a failure — it is the honest answer to "steer a batch
+# you never measured".
+#
+# To close the loop for real, scan the generated batch first:
+#   bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch.json" \
+#     --n "$N_SCAN" --out "$OUT/rsi/scan_batch.json"
+#   CURRICULUM_SCAN="$OUT/rsi/scan_batch.json" bash pipeline.sh
+# The cost is n x 4 harnesses x batch tasks of rollout time, and it is the
+# price of steering on evidence rather than on the shipped suite's numbers.
+CURRICULUM_ARGS=(--task-batch "${TASK_BATCH:-12}" --scan "${CURRICULUM_SCAN:-$OUT/scan_all.json}")
+if [ "${APPLY_CURRICULUM:-0}" = "1" ]; then
+  CURRICULUM_ARGS+=(--apply-curriculum)
+fi
+bash "$RUN" scripts/rsi_loop.py "${CURRICULUM_ARGS[@]}"
+
 if [ "${SKIP_TRAIN:-0}" != "1" ]; then
-  banner "STAGE 3/5  train — SINGLE harness (baseline arm)"
+  banner "STAGE 4/6  train — SINGLE harness (baseline arm)"
   bash "$RUN" scripts/train.py \
     --mode single --steps "$STEPS" --scan "$OUT/scan_all.json" \
     --tag "single-s${STEPS}"
 
-  banner "STAGE 4/5  train — MULTI harness (treatment arm)"
+  banner "STAGE 5/6  train — MULTI harness (treatment arm)"
   bash "$RUN" scripts/train.py \
     --mode multi --steps "$STEPS" --scan "$OUT/scan_all.json" \
     --tag "multi-s${STEPS}"
@@ -85,7 +114,7 @@ else
   echo "SKIP_TRAIN=1 -> reusing checkpoints under $OUT"
 fi
 
-banner "STAGE 5/5  eval — baseline + single + multi in ONE process"
+banner "STAGE 6/6  eval — baseline + single + multi in ONE process"
 # All three arms run in a single invocation so the ablation table is produced
 # with a shared seed and shared harness instances. Splitting this into three
 # commands would lose the comparison and make the arms non-paired.

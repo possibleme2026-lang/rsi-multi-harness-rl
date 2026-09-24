@@ -14,7 +14,7 @@
 
 """Recursive self-improvement: the loop writes its own tasks, rewards, and harnesses.
 
-The seven modules here are the loop, split by the question each one answers.
+The eight modules here are the loop, split by the question each one answers.
 
 ``stats``
     *Can this cell teach anything?* Wilson intervals, the GRPO dead-group
@@ -33,7 +33,12 @@ The seven modules here are the loop, split by the question each one answers.
     cross-harness solvability plus variance.
 ``band``
     *Where does it sit on the difficulty curve?* Three bands plus an honest
-    ``unresolved``, which is the curriculum's steering signal.
+    ``unresolved``, and the steering rule that names a direction.
+``curriculum``
+    *What should the next batch be?* The α-Curriculum Reward and the plan that
+    turns a band into a regenerated task. This is the call site ``band.steer``
+    did not have: the rule existed and was tested, but no pipeline script ever
+    invoked it, so the loop had never closed.
 ``harness_evolve``
     *Can the interface be improved for this policy?* Descriptor edits over
     guidance, tools, submission, and context, guarded and judged against the
@@ -64,6 +69,7 @@ __all__ = [
     "verifier_gen",
     "validate",
     "band",
+    "curriculum",
     "harness_evolve",
     "ledger",
 ]

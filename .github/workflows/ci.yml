@@ -95,6 +95,7 @@ jobs:
           python tests/test_rsi_stats.py
           python tests/test_rsi_generator.py
           python tests/test_rsi_loop.py
+          python tests/test_rsi_curriculum.py
           python tests/smoke_env.py
 
   # The figures are evidence, so they are checked like evidence: decoded from

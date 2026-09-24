@@ -61,6 +61,18 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=8, help="rollouts per (harness, task) cell")
     ap.add_argument("--tasks", default="t1-01,t1-03,t3-01",
                     help="comma-separated task ids to probe")
+    # A generated batch is a different task set from the shipped suite: the
+    # suite's ids are `t1-01`, a generated task's are `t1-8f87ad9e`, and the two
+    # do not intersect. Without this flag the curriculum could never scan the
+    # batch it intends to steer — it would read a scan of 16 ids, find none of
+    # them in the batch, and correctly but uselessly refuse to move anything.
+    #
+    # The batch is read from a JSON file written by `rsi_loop.py --dump-batch`,
+    # not regenerated here, because regeneration is deterministic only given the
+    # same seed *and* the same call order, and a second process is the easiest
+    # way to get a subtly different batch while every id still looks valid.
+    ap.add_argument("--from-batch", default=None,
+                    help="JSON file of generated tasks to probe instead of the shipped suite")
     ap.add_argument("--harnesses", default=",".join(TRAIN_HARNESSES),
                     help="comma-separated harness names")
     ap.add_argument("--max-turns", type=int, default=4)
@@ -69,9 +81,21 @@ def main() -> int:
                     help="scan dump path (default: $MULTIHARNESS_OUT/scan_all.json)")
     args = ap.parse_args()
 
-    load_tasks()
+    if args.from_batch:
+        from multiharness.harnesses.core import TASKS, register_tasks
 
-    task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        batch = json.loads(Path(args.from_batch).read_text(encoding="utf-8"))
+        # The shipped suite still has to be loaded: `Agent.run` resolves task ids
+        # through the process-global registry, and `reset` on a shipped id would
+        # fail in a fresh process without it.
+        load_tasks()
+        fresh = [t for t in batch if t["id"] not in TASKS]
+        register_tasks(fresh)
+        task_ids = [t["id"] for t in batch]
+        print(f"batch     : {args.from_batch}  ({len(task_ids)} generated tasks registered)")
+    else:
+        load_tasks()
+        task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
     harness_names = [h.strip() for h in args.harnesses.split(",") if h.strip()]
 
     print("=" * 78)
