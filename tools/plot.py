@@ -494,7 +494,15 @@ def fig_toolcall_reward(scan: dict) -> None:
 
 
 def fig_edit_budget() -> None:
-    """The annealed edit budget, from the same function the loop calls."""
+    """The annealed edit budget, from the same function the loop calls.
+
+    The curve is drawn over ``t = 0..T`` so the anneal's shape and its endpoint
+    are both visible, but only ``t = 0..T-1`` are rounds a run executes: a
+    ``T``-round loop calls ``edit_budget`` ``T`` times. Drawing the whole curve
+    without saying so is how a 13-entry schedule for a 12-round run reached the
+    README, so the executed rounds carry filled markers and ``t = T`` is drawn
+    open and annotated as the limit rather than a round.
+    """
     plt = _plt()
     sys.path.insert(0, str(ROOT / "src"))
     from multiharness.rsi.ledger import edit_budget
@@ -504,11 +512,18 @@ def fig_edit_budget() -> None:
         xs = list(range(T + 1))
         ys = [edit_budget(t, T, 1, 3) for t in xs]
         ax.step(xs, ys, where="post", color=color, lw=2.0, label=f"T={T}")
+        # Filled = rounds the loop actually runs; open = the formula at t = T.
+        ax.plot(xs[:-1], ys[:-1], "o", color=color, ms=4.0, zorder=3)
+        ax.plot(xs[-1:], ys[-1:], "o", color=color, ms=4.5, mfc="white", mew=1.4, zorder=3)
+    # The explanation goes in the legend rather than as floating text: the middle
+    # of this axes is where the T=24 step lives, and an annotation there lands on
+    # top of it. A proxy handle cannot collide with the data.
+    ax.plot([], [], "o", color=INK, ms=4.5, mfc="white", mew=1.4, label="open = t = T (not a round)")
     ax.set_xlabel("round t")
     ax.set_ylabel("edits allowed in one proposal")
     ax.set_yticks([1, 2, 3])
     ax.set_ylim(0.8, 3.3)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8.5, loc="upper right")
     ax.set_title("Annealed edit budget — several edits early, one edit late", fontsize=11, pad=10)
     _save(plt, fig, "fig09_edit_budget.png", "analytic; ceil(b_min + (b_max-b_min)/2 (1+cos(pi t/T)))")
 
