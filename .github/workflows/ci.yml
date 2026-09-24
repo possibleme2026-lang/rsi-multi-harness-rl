@@ -98,6 +98,13 @@ jobs:
           python tests/test_rsi_curriculum.py
           python tests/test_rsi_envgen.py
           python tests/smoke_env.py
+          # Gate V1 applied to the harness axis: the reference solution must
+          # reach 1.0 through each harness's *own* tools, held-out included.
+          # smoke_env.py checks this through OracleHarness, which writes the
+          # answer directly and never touches the tool surface -- so without
+          # this step a harness could be unsolvable and every guard would still
+          # pass. No model, no GPU, ~20s.
+          python scripts/harness_solvability.py
 
   # The figures are evidence, so they are checked like evidence: decoded from
   # the committed bytes with nothing but the standard library. A plotting bug

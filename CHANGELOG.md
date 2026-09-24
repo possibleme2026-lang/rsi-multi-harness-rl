@@ -475,5 +475,29 @@ before it.
   is the accept *rate*, which fell ~8×. The previously reported replayed
   trajectory of `0.471 → 0.528` describes the stand-in function rather than a
   harness.
+- **The headline ablation metric is an identity, and the run used to report it
+  backwards.** `gap = mean(train) − mean(held-out)`, and the only held-out
+  harness scored **0/96** pooled across all three arms (95% CI `[0, 0.0385]`,
+  `DEAD` rather than under-measured). With the held-out term at 0, `gap` *is*
+  `mean(train)`, so ranking arms by gap ranked them by train mean — and picked
+  the arm that improved least, printing "hypothesis NOT supported" for an arm
+  the same run called "overfitting the train harnesses". `eval.py` now refuses
+  that comparison when the held-out mean is exactly 0.0 and prints the identity
+  plus a one-sided bound instead (`gap ≥ 0.2271` single, `≥ 0.2662` multi):
+  real and large, but identical to the train term and therefore silent about
+  generalization. New `scripts/harness_solvability.py` rules out the harness as
+  the cause — the reference solution reaches 1.0 on **120/120** (5 harnesses ×
+  24 tasks), `codex_style` included, via its own `apply_patch` — and
+  `scripts/diag.py` shows the model emits no tool calls at all. The floor is the
+  policy's, not the harness's.
+- **`rollouts_for_dead` added to `rsi/stats.py`.** The DEAD boundary (n ≥ 73 at
+  zero passes, n ≥ 110 at one) previously existed only as prose in a docstring —
+  which is where the incorrect "roughly n ≥ 128" lived. It is now a function,
+  with assertions pinning it to the boundary `classify_cell` actually applies.
+- **`pool.py` no longer misattributes `codex_style`'s zeros.** It credited the
+  `apply_patch` heredoc bug. That bug is real, but it was not the cause:
+  `eval_ablation.json` and `eval_ablation_pre_harness_fix.json` are
+  byte-identical (`md5 38f7a0dacbeb9eef8e74480608bd7dc1`), so the fix moved
+  nothing. A plausible cause near the symptom is not a cause.
 
 [Unreleased]: https://github.com/possibleme2026-lang/rsi-multi-harness-rl/commits/main

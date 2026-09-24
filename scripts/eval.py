@@ -256,6 +256,18 @@ def main() -> int:
                     print("      This is a *positive* finding, not a call for more data: the")
                     print(f"      upper bound is below the {rsi_stats.SIGNAL_LO:.2f} signal floor, so the")
                     print("      held-out harness is provably outside the learnable band.")
+                    # A floor is not a refusal to report -- it is a bound. Since
+                    # the held-out term cannot exceed `cell.hi`, the gap cannot
+                    # fall below `mean_train - cell.hi`. That is one-sided but
+                    # real, and it is the strongest statement the data supports.
+                    print("\n      What *can* be reported is a one-sided bound, since held-out")
+                    print(f"      <= {cell.hi:.4f} makes gap >= mean(train) - {cell.hi:.4f}:")
+                    print(f"      {'arm':<24}{'mean(train)':>13}{'gap >= ':>10}")
+                    for name in trained:
+                        tr = results[name]["mean_train_harness"]
+                        print(f"      {name:<24}{tr:>13.4f}{tr - cell.hi:>10.4f}")
+                    print("      The ranking of those bounds is the ranking of mean(train), which")
+                    print("      is why it carries no information about generalization.")
                 else:
                     print("      The interval is too wide to call this DEAD, which at 0 passes")
                     print(f"      needs n >= {rsi_stats.rollouts_for_dead()} per cell; this run used")

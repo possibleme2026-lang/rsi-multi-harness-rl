@@ -234,6 +234,55 @@ measured run is 3 rounds against the replayed run's 6, so the attempt counts are
 not like-for-like — the accept *rate* is the comparable quantity, and it fell by
 roughly 8×.
 
+### The held-out term is a floor, so the gap is an identity
+
+The ablation's headline number is `gap = mean(train harnesses) − mean(held-out
+harness)`. Pooled over all three arms, `codex_style` — the only held-out
+harness — scores **0 out of 96**. Its 95% interval is `[0, 0.0385]`, which sits
+below the `0.05` signal floor: this is `DEAD`, not merely under-measured, and
+that is a *positive* finding rather than a request for more data. The held-out
+term is not small; it is outside the band the policy can learn from at all.
+
+The consequence is that `gap ≡ mean(train)` is an **identity**, not a
+measurement, and no number of training steps changes that. Ranking arms by gap
+ranks them by train mean under another name — and it ranks them *backwards*,
+because the arm that improved least has the smallest gap. An earlier version of
+`eval.py` printed "multi-harness training produced the smaller gap — hypothesis
+NOT supported" from that comparison while the per-arm verdict for the same arm
+read "overfitting the train harnesses". Both cannot be the headline; the
+comparison is now refused when the held-out mean is exactly zero, and the
+identity is printed in its place.
+
+What *can* be reported is one-sided, and it is worth stating because it is not
+nothing: since the held-out term cannot exceed `0.0385`, the gap cannot fall
+below `mean(train) − 0.0385`.
+
+| arm | mean(train) | gap ≥ |
+| --- | --- | --- |
+| `train-single-s64` | 0.2656 | **0.2271** |
+| `train-multi-s64` | 0.3047 | **0.2662** |
+
+So the gap is real and large. It is also *identical* to the train term, which is
+why it carries no information about generalization — the ranking of those bounds
+is the ranking of `mean(train)`.
+
+**Before that zero could be read as a capability result, two things had to be
+ruled out.** `tests/smoke_env.py` already asserted the oracle scores 1.0 on all
+24 tasks — but through `OracleHarness`, which writes the answer directly and
+never touches the harness's advertised tools. That proves the *verifier* is
+correct; it does not prove the task is solvable by an agent holding that
+harness's tool surface, and those are different claims. `scripts/harness_solvability.py`
+closes it by driving the reference solution through each harness's *own* tools:
+**120/120** across 5 harnesses × 24 tasks, with `codex_style` passing 24/24 via
+`apply_patch`. The harness is capable. And transcripts
+(`scripts/diag.py --harness codex_style`) show why the model scores zero anyway:
+it emits **no tool calls at all**, spending the budget on planning prose — which
+this harness's own "Plan first, then act" guidance invites — or on a JSON call
+written inside a markdown fence, which the parser does not accept.
+
+The floor is the policy's, not the harness's. Reporting this gap as a measured
+generalization number would be reporting `0 == 0`.
+
 ## The gates, and why there are four
 
 A generated task is not trusted until it survives all four. They are applied to
