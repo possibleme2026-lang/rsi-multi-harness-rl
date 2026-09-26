@@ -351,6 +351,27 @@ def test_pipeline_scans_the_batch(tmp: Path) -> None:
         "a steered-batch scan that misses its ids is fatal",
         "measures none of the" in src and "steered ids" in src,
     )
+    # A zero-move plan is a result too -- it says the batch was already on target
+    # or that the scan was too coarse. Gating the report on `moved > 0` would
+    # leave `loop_closed.json` absent in exactly the case that most needs a
+    # number, and a missing file reads as "skipped" rather than "measured zero".
+    check(
+        "the alignment report runs even when nothing moved",
+        "AFTER_SCAN=\"$CURRICULUM_SCAN\"" in src,
+        "a zero-move plan still has to produce a measured delta",
+    )
+    check(
+        "the report is not gated on a positive move count",
+        'STEER_AND_RESCAN:-1}" = "1" ] && [ "$APPLY" = "1" ]' in src,
+        "the rescan is gated on moves; the report must not be",
+    )
+    check(
+        "a second run can avoid clobbering the first run's checkpoints",
+        'TAG_SUFFIX="${TAG_SUFFIX:-}"' in src
+        and 'train-multi-s${STEPS}${TAG_SUFFIX}' in src
+        and 'eval_ablation${TAG_SUFFIX}.json' in src,
+        "the tag names the checkpoint dir and the eval reads it back by tag",
+    )
     check(
         "N_SCAN defaults above the band-resolution floor",
         'N_SCAN="${N_SCAN:-64}"' in src,

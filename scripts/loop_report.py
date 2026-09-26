@@ -227,9 +227,11 @@ def main() -> int:
     # and only one of them is about the generator.
     if not moved:
         interp = (
-            "no tasks were moved, so there is no before/after to compare. This is "
-            "a statement about the scan (see move_diagnosis in curriculum.json), "
-            "not about the generator."
+            "no tasks were moved, so the delta above is 0 by construction and "
+            "carries no evidence either way — the steered batch is the original "
+            "batch, compared against its own scan. This is a statement about the "
+            "scan or about the batch already being on target (see move_diagnosis "
+            "in curriculum.json), not about the generator."
         )
     elif delta > 0:
         interp = (
@@ -298,6 +300,12 @@ def main() -> int:
         "kept": kept,
         "directions": directions,
         "alignment_delta": round(delta, 6),
+        # Whether the delta is evidence. With zero moves the steered batch *is*
+        # the original and is compared against its own scan, so the delta is 0
+        # for arithmetic reasons rather than because the batch was measured to be
+        # well-placed. Flagged in the payload so a reader (or a figure) cannot
+        # pick up the number without the caveat that belongs to it.
+        "delta_is_evidence": bool(moved),
         "interpretation": interp,
         "alpha": cu.DEFAULT_ALPHA,
         "alpha_derived_from_g": cu.DEFAULT_G,

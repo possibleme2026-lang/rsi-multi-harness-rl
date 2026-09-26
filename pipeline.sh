@@ -33,6 +33,15 @@
 #   APPLY_CURRICULUM=0 bash pipeline.sh   # plan the curriculum but do not apply
 #   STEER_AND_RESCAN=0 bash pipeline.sh   # apply, but train on the pre-steer batch
 #   TRAIN_ON_BATCH=0 bash pipeline.sh     # train on the shipped suite instead
+#   TAG_SUFFIX=-steer bash pipeline.sh    # write train-*-steer/ instead of overwriting
+#
+# TAG_SUFFIX exists so a second full run can be made without destroying the
+# first one's checkpoints. The tag decides the output directory, and the
+# evaluation reads the checkpoints back by tag, so a run that steers the batch
+# and a run that does not would otherwise collide on `train-multi-s48` and on
+# `eval_ablation.json` -- the second silently replacing the first, which is the
+# failure this repository has been fixing all along: an artifact that looks
+# current and describes a different experiment.
 #
 # Stage 3 is the one that closes the loop, and the ordering in it is the
 # mechanism rather than a detail: a batch has to exist before it can be
@@ -58,6 +67,12 @@ STEPS="${STEPS:-40}"
 # cell in any band, so every task is held and the axis is inert.
 N_SCAN="${N_SCAN:-64}"
 N_EVAL="${N_EVAL:-4}"
+# Empty by default, so the documented invocation keeps producing the documented
+# artifacts. A non-empty suffix redirects every tag-dependent path at once, which
+# is why it is a suffix on the tag rather than a separate `--out` per script: the
+# trainer names its directory from the tag and the evaluator reads it back by
+# tag, so the two only stay consistent if one variable moves both.
+TAG_SUFFIX="${TAG_SUFFIX:-}"
 OUT="${MULTIHARNESS_OUT:-$PWD/outputs}"
 mkdir -p "$OUT"
 
@@ -194,16 +209,24 @@ print(int(cur.get("steered", {}).get("moved", 0)))
 PY
 )"
 
-if [ "${STEER_AND_RESCAN:-1}" = "1" ] && [ "$APPLY" = "1" ] && [ "${STEERED_MOVED:-0}" -gt 0 ]; then
-  echo "-- $STEERED_MOVED task(s) moved -> scanning the steered batch and training on IT"
-  bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch_steered.json" \
-    --n "$N_SCAN" --out "$OUT/rsi/scan_batch_steered.json"
-  TRAIN_BATCH_PATH="$OUT/rsi/batch_steered.json"
-  TRAIN_SCAN_PATH="$OUT/rsi/scan_batch_steered.json"
+if [ "${STEER_AND_RESCAN:-1}" = "1" ] && [ "$APPLY" = "1" ]; then
+  # The scan the report compares against. It is the rescan when something moved,
+  # and the original scan when nothing did -- in that case the steered batch is a
+  # byte-for-byte copy of batch.json, so the same measurements describe it
+  # exactly and paying for a second scan would buy the same numbers.
+  AFTER_SCAN="$CURRICULUM_SCAN"
 
-  # Same guard as above, for the same reason: the steered batch carries new
-  # hashed ids, and a scan that misses them would train on unmeasured rows.
-  bash "$RUN" - "$TRAIN_SCAN_PATH" "$TRAIN_BATCH_PATH" <<'PY'
+  if [ "${STEERED_MOVED:-0}" -gt 0 ]; then
+    echo "-- $STEERED_MOVED task(s) moved -> scanning the steered batch and training on IT"
+    bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch_steered.json" \
+      --n "$N_SCAN" --out "$OUT/rsi/scan_batch_steered.json"
+    TRAIN_BATCH_PATH="$OUT/rsi/batch_steered.json"
+    TRAIN_SCAN_PATH="$OUT/rsi/scan_batch_steered.json"
+    AFTER_SCAN="$TRAIN_SCAN_PATH"
+
+    # Same guard as above, for the same reason: the steered batch carries new
+    # hashed ids, and a scan that misses them would train on unmeasured rows.
+    bash "$RUN" - "$TRAIN_SCAN_PATH" "$TRAIN_BATCH_PATH" <<'PY'
 import json, sys
 scan = json.loads(open(sys.argv[1], encoding="utf-8").read())
 batch = json.loads(open(sys.argv[2], encoding="utf-8").read())
@@ -214,18 +237,23 @@ print(f"steered scan ids {len(scan_ids)}  batch ids {len(batch_ids)}  overlap {l
 if not overlap:
     sys.exit(f"FATAL: {sys.argv[1]} measures none of the {len(batch_ids)} steered ids")
 PY
+  else
+    echo "-- no tasks moved (see move_diagnosis in curriculum.json) -> reusing the scan"
+    echo "   the steered batch is a copy of the original, so the same scan describes it"
+  fi
 
-  # The before/after comparison. This is the only number in the repository that
-  # the task axis produces and that could come out negative.
+  # The before/after comparison, run on both paths. This is the only number in
+  # the repository that the task axis produces and that could come out negative,
+  # and a zero-move plan is itself a result -- it says the batch was already on
+  # target or that the scan was too coarse to see it. Writing the report in both
+  # cases is what makes "no moves" an artifact with a number rather than a
+  # missing file that reads as "the step was skipped".
   bash "$RUN" scripts/loop_report.py \
     --before-batch "$OUT/rsi/batch.json" \
     --before-scan "$CURRICULUM_SCAN" \
     --after-batch "$OUT/rsi/batch_steered.json" \
-    --after-scan "$TRAIN_SCAN_PATH" \
+    --after-scan "$AFTER_SCAN" \
     --out "$OUT/rsi/loop_closed.json"
-elif [ "${STEERED_MOVED:-0}" -eq 0 ]; then
-  echo "-- no tasks moved (see move_diagnosis in curriculum.json) -> reusing the scan"
-  echo "   the steered batch is a copy of the original, so the same scan describes it"
 else
   echo "STEER_AND_RESCAN=$STEER_AND_RESCAN or APPLY_CURRICULUM=$APPLY -> training on the pre-steer batch"
 fi
@@ -252,12 +280,12 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   banner "STAGE 4/6  train — SINGLE harness (baseline arm)"
   bash "$RUN" scripts/train.py \
     --mode single --steps "$STEPS" "${TRAIN_SCAN_ARGS[@]}" "${TRAIN_BATCH_ARGS[@]}" \
-    --tag "single-s${STEPS}"
+    --tag "single-s${STEPS}${TAG_SUFFIX}"
 
   banner "STAGE 5/6  train — MULTI harness (treatment arm)"
   bash "$RUN" scripts/train.py \
     --mode multi --steps "$STEPS" "${TRAIN_SCAN_ARGS[@]}" "${TRAIN_BATCH_ARGS[@]}" \
-    --tag "multi-s${STEPS}"
+    --tag "multi-s${STEPS}${TAG_SUFFIX}"
 else
   echo "SKIP_TRAIN=1 -> reusing checkpoints under $OUT"
 fi
@@ -268,9 +296,9 @@ banner "STAGE 6/6  eval — baseline + single + multi in ONE process"
 # commands would lose the comparison and make the arms non-paired.
 bash "$RUN" scripts/eval.py \
   --baseline \
-  --adapter "$OUT/train-single-s${STEPS}/final" \
-  --adapter "$OUT/train-multi-s${STEPS}/final" \
-  --n "$N_EVAL" --out "$OUT/eval_ablation.json"
+  --adapter "$OUT/train-single-s${STEPS}${TAG_SUFFIX}/final" \
+  --adapter "$OUT/train-multi-s${STEPS}${TAG_SUFFIX}/final" \
+  --n "$N_EVAL" --out "$OUT/eval_ablation${TAG_SUFFIX}.json"
 
 banner "PIPELINE COMPLETE"
 echo "artifacts in $OUT:"

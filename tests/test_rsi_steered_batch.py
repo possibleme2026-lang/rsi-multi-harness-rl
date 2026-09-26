@@ -272,7 +272,7 @@ def test_apply_writes_the_steered_batch(tmp: Path) -> None:
     )
     check(
         "alignment_before is a number",
-        isinstance(cur.get("alignment_before"), (int, float)),
+        isinstance(cur.get("alignment_before"), int | float),
         str(cur.get("alignment_before")),
     )
 
@@ -432,6 +432,11 @@ def test_loop_report(tmp: Path) -> None:
         check("it counts the kept tasks", rep["kept"] == 0, str(rep["kept"]))
         check("it records the direction", rep.get("directions") == {"easier": len(batch)})
         check(
+            "a real move makes the delta evidence",
+            rep["delta_is_evidence"] is True,
+            "a delta between two different scans is a measurement",
+        )
+        check(
             "the interpretation says this is about alignment, not learning",
             "alignment" in rep["interpretation"] and "learning" in rep["interpretation"],
         )
@@ -484,6 +489,20 @@ def test_loop_report(tmp: Path) -> None:
         "a zero-move report blames the scan, not the generator",
         "scan" in rep["interpretation"] and "generator" in rep["interpretation"],
         rep["interpretation"][:140],
+    )
+    # The zero here is arithmetic, not measurement: with no moves the "after"
+    # batch is the "before" batch, so the delta is 0 whatever the batch is like.
+    # The payload has to say so, or a figure or a README sentence will pick the
+    # number up as if the batch had been measured to be well-placed.
+    check(
+        "a zero-move delta is flagged as not evidence",
+        rep["delta_is_evidence"] is False,
+        "a delta computed against the same scan twice is a tautology, not a finding",
+    )
+    check(
+        "a zero-move delta is described as zero by construction",
+        "by construction" in rep["interpretation"],
+        rep["interpretation"][:160],
     )
 
 
