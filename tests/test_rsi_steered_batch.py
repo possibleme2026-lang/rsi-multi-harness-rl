@@ -471,6 +471,68 @@ def test_loop_report(tmp: Path) -> None:
         rep["interpretation"][:120],
     )
 
+    # The defect the first real run exposed: the pooled delta includes the kept
+    # tasks, which are a control group (the same task measured twice). Pooling
+    # them lets sampling noise decide the sign of the headline number, and the
+    # script then reports noise as a steering defect. Here the moved tasks all
+    # improve and the untouched ones all drift down, so the pooled delta is
+    # negative while the treatment is positive.
+    mixed = out / "rsi"
+    # Rebuild with the first half moved and the second kept: the moved tasks
+    # rise, the untouched ones drift down, so the pooled delta is negative while
+    # the treatment is positive.
+    half = len(batch) // 2
+    half_batch = [dict(t, regenerated_from=t["id"], regenerated_band="out_of_reach",
+                       regenerated_direction="easier") for t in batch[:half]] + \
+                 [dict(t) for t in batch[half:]]
+    (mixed / "batch_half.json").write_text(json.dumps(half_batch, indent=2), encoding="utf-8")
+    write_scan(mixed / "scan_half_before.json",
+               {t["id"]: (16, 64) for t in half_batch[:half]}
+               | {t["id"]: (32, 64) for t in half_batch[half:]})
+    after_half = {t["id"]: (32, 64) for t in half_batch[:half]}
+    after_half.update({t["id"]: (0, 64) for t in half_batch[half:]})
+    write_scan(mixed / "scan_half_after.json", after_half)
+    code, log = run(
+        "scripts/loop_report.py",
+        "--before-batch", str(mixed / "batch.json"),
+        "--before-scan", str(mixed / "scan_half_before.json"),
+        "--after-batch", str(mixed / "batch_half.json"),
+        "--after-scan", str(mixed / "scan_half_after.json"),
+        "--out", str(mixed / "loop_half.json"),
+    )
+    rep = json.loads((mixed / "loop_half.json").read_text(encoding="utf-8"))
+    check(
+        "the treatment and the control are reported separately",
+        "alignment_delta_moved" in rep and "alignment_delta_kept" in rep,
+        "the kept tasks are the noise floor, not a result",
+    )
+    check(
+        "the treatment delta is positive when the moved tasks improve",
+        rep["alignment_delta_moved"] > 0,
+        str(rep["alignment_delta_moved"]),
+    )
+    check(
+        "the control delta is negative when the untouched tasks drift down",
+        rep["alignment_delta_kept"] < 0,
+        str(rep["alignment_delta_kept"]),
+    )
+    check(
+        "the pooled delta is not used as the verdict",
+        rep["interpretation"].startswith("positive on the treatment")
+        or "positive on the treatment" in rep["interpretation"],
+        rep["interpretation"][:120],
+    )
+    check(
+        "the sign disagreement is called out rather than hidden",
+        "disagrees in sign" in rep["interpretation"],
+        rep["interpretation"][-200:],
+    )
+    check(
+        "a non-negative treatment does not fail the run",
+        code == 0,
+        "exiting on the pooled delta would fail the pipeline over noise",
+    )
+
     # A zero-move report must not claim a curriculum effect.
     no_moves = out / "rsi" / "batch_unchanged.json"
     no_moves.write_text(json.dumps(batch, indent=2), encoding="utf-8")

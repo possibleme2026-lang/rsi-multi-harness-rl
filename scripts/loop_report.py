@@ -174,6 +174,45 @@ def main() -> int:
         d = str(t.get("regenerated_direction", "?"))
         directions[d] = directions.get(d, 0) + 1
 
+    # ---- the treatment and the control -------------------------------------
+    # A steered batch contains two populations that must not be pooled. The
+    # moved tasks are the treatment: their before and after are two *different*
+    # tasks, so a change in their α-reward is attributable to the steering rule.
+    # The kept tasks are a control: they are the same task measured twice, so any
+    # change in their α-reward is sampling noise and nothing else.
+    #
+    # Pooling them was a real defect in the first version of this script. In the
+    # first measured run the whole-batch delta came out negative (-0.0031) and
+    # the script called it "the steering rule is moving tasks in a direction its
+    # own band definition disagrees with". That was wrong: every moved task had
+    # a delta >= 0, and the entire negative came from three kept tasks drifting
+    # by a rollout or two (58/256 -> 54/256 on a task that was never touched).
+    # The control group was reporting the noise floor and the script read it as
+    # a treatment effect. The fix is to compute the two deltas separately and
+    # let the verdict rest on the treatment, with the control printed as the
+    # scale against which the treatment has to be read.
+    def _delta(task: dict) -> tuple[float, float, float] | None:
+        """``(before_p, after_p, delta_alpha_reward)`` for one after-batch task."""
+        src = task.get("regenerated_from", task["id"])
+        if src not in before_rates or task["id"] not in after_rates:
+            return None
+        pb = before_rates[src]
+        pa = after_rates[task["id"]]
+        return pb, pa, cu.alpha_reward(pa) - cu.alpha_reward(pb)
+
+    per_task: list[tuple[str, str, float, float, float, bool]] = []
+    for t in after_batch:
+        d = _delta(t)
+        if d is None:
+            continue
+        per_task.append((t.get("regenerated_from", t["id"]), t["id"], d[0], d[1], d[2],
+                         "regenerated_from" in t))
+
+    moved_rows = [r for r in per_task if r[5]]
+    kept_rows = [r for r in per_task if not r[5]]
+    delta_moved = sum(r[4] for r in moved_rows) / len(moved_rows) if moved_rows else 0.0
+    delta_kept = sum(r[4] for r in kept_rows) / len(kept_rows) if kept_rows else 0.0
+
     before_measured = sum(1 for tid in before_ids if tid in before_rates)
     after_measured = sum(1 for tid in after_ids if tid in after_rates)
 
@@ -189,7 +228,16 @@ def main() -> int:
     print(f"  kept         : {kept}  (on the frontier, or unmeasured)")
     print()
     print(f"  alignment    : before {before_align:.4f}  ->  after {after_align:.4f}"
-          f"   delta {delta:+.4f}")
+          f"   delta {delta:+.4f}   (whole batch)")
+    # The two populations, kept apart. The treatment is the number the steering
+    # rule is answerable for; the control is the noise floor that number has to
+    # clear before it means anything.
+    if moved_rows:
+        print(f"  moved delta  : {delta_moved:+.4f}   over {len(moved_rows)} replaced tasks"
+              f"   (treatment)")
+    if kept_rows:
+        print(f"  kept  delta  : {delta_kept:+.4f}   over {len(kept_rows)} untouched tasks"
+              f"   (control — same task twice, so this is noise)")
     print()
 
     # The bands, before and after. This is the number that says whether the
@@ -225,6 +273,12 @@ def main() -> int:
     # a zero delta — gets the most careful wording, because "the curriculum did
     # nothing" and "the curriculum could not do anything" are different findings
     # and only one of them is about the generator.
+    #
+    # The verdict rests on `delta_moved`, the treatment effect, not on the pooled
+    # `delta`. The pooled number includes the control group, so it can be
+    # negative while every task the steering rule actually touched improved —
+    # which is exactly what the first measured run showed. Reading the pooled
+    # number as a verdict means reading sampling noise as a defect.
     if not moved:
         interp = (
             "no tasks were moved, so the delta above is 0 by construction and "
@@ -233,19 +287,22 @@ def main() -> int:
             "scan or about the batch already being on target (see move_diagnosis "
             "in curriculum.json), not about the generator."
         )
-    elif delta > 0:
+    elif delta_moved > 0:
         interp = (
-            "positive: the batch moved toward the band GRPO has signal at. This is "
-            "the task axis doing what it claims. It is a statement about *alignment*, "
-            "not yet about learning — whether the policy improves on the steered "
-            "batch is the training run's question."
+            f"positive on the treatment: the {len(moved_rows)} replaced tasks moved "
+            "toward the band GRPO has signal at. This is the task axis doing what it "
+            "claims. It is a statement about *alignment*, not yet about learning — "
+            "whether the policy improves on the steered batch is the training run's "
+            "question. Read it against the control: the untouched tasks' delta is "
+            "the noise floor, and the treatment has to be larger than it to mean "
+            "anything."
         )
-    elif delta < 0:
+    elif delta_moved < 0:
         interp = (
-            "negative: the batch moved away from the learnable band. The steering "
-            "rule is moving tasks in a direction its own band definition disagrees "
-            "with — a real defect, and the reason this script exists rather than "
-            "another pass/fail gate."
+            f"negative on the treatment: the {len(moved_rows)} replaced tasks moved "
+            "away from the learnable band. The steering rule is moving tasks in a "
+            "direction its own band definition disagrees with — a real defect, and "
+            "the reason this script exists rather than another pass/fail gate."
         )
     else:
         # Zero has several causes and they are not equivalent. Distinguished by
@@ -258,17 +315,30 @@ def main() -> int:
             )
         elif before_mix.get(cu.band_mod.Band.OUT_OF_REACH, 0) > 0:
             interp = (
-                "zero despite moving tasks out of the out-of-reach band. The moves "
-                "reduced difficulty but not enough to cross into the frontier — the "
-                "steer step size (a single step per knob) is too small for the gap "
-                "that was measured. Widen the step or scan at a larger n."
+                "zero on the treatment despite moving tasks out of the out-of-reach "
+                "band. The moves reduced difficulty but not enough to cross into the "
+                "frontier — the steer step size (a single step per knob) is too small "
+                "for the gap that was measured. Widen the step or scan at a larger n."
             )
         else:
             interp = (
-                "zero with tasks moved. The moves cancelled in aggregate — some "
-                "easier, some harder, netting out. Read the band table above rather "
-                "than the alignment delta alone."
+                "zero on the treatment with tasks moved. The moves cancelled in "
+                "aggregate — some easier, some harder, netting out. Read the band "
+                "table above rather than the alignment delta alone."
             )
+
+    # The pooled delta can disagree with the treatment, and when it does the
+    # disagreement is the finding rather than a detail: it means the control
+    # group moved more than the treatment did, so no steering conclusion can be
+    # drawn at this n. Said explicitly so the pooled number is never quoted alone.
+    if moved and kept_rows and (delta > 0) != (delta_moved > 0):
+        interp += (
+            f" The whole-batch delta ({delta:+.4f}) disagrees in sign with the "
+            f"treatment delta ({delta_moved:+.4f}) because the {len(kept_rows)} "
+            "untouched tasks moved further than the replaced ones — that is "
+            "sampling noise in the control, and it means the treatment is not "
+            "distinguishable from the noise floor at this n."
+        )
 
     print("  interpretation:")
     for line in interp.split(". "):
@@ -299,7 +369,27 @@ def main() -> int:
         "moved": len(moved),
         "kept": kept,
         "directions": directions,
+        # The pooled delta, and the treatment/control split it hides. The pooled
+        # number is kept for continuity with the printed table, but the verdict
+        # and the exit code rest on `alignment_delta_moved`: the kept tasks are a
+        # control group (the same task measured twice), so their movement is the
+        # noise floor and pooling it into the headline lets noise decide the sign.
         "alignment_delta": round(delta, 6),
+        "alignment_delta_moved": round(delta_moved, 6),
+        "alignment_delta_kept": round(delta_kept, 6),
+        "moved_measured": len(moved_rows),
+        "kept_measured": len(kept_rows),
+        "per_task": [
+            {
+                "from": r[0],
+                "to": r[1],
+                "before_pass_rate": round(r[2], 6),
+                "after_pass_rate": round(r[3], 6),
+                "delta_alpha_reward": round(r[4], 6),
+                "moved": r[5],
+            }
+            for r in per_task
+        ],
         # Whether the delta is evidence. With zero moves the steered batch *is*
         # the original and is compared against its own scan, so the delta is 0
         # for arithmetic reasons rather than because the batch was measured to be
@@ -312,17 +402,24 @@ def main() -> int:
         "note": (
             "alignment is the mean α-reward over measured tasks, where α is the "
             "pass rate with maximal GRPO signal. It is a statement about the "
-            "batch's position in difficulty space, not about policy learning."
+            "batch's position in difficulty space, not about policy learning. "
+            "`alignment_delta_moved` is the treatment effect; "
+            "`alignment_delta_kept` is the noise floor from the untouched control "
+            "tasks and is not a result."
         ),
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"wrote {out_path}")
 
-    # A negative delta is the one outcome this script is built to catch, so it
-    # is worth a non-zero exit: a CI job or a pipeline can gate on it. Zero is
-    # not an error — it has innocent explanations, listed above.
-    return 1 if delta < 0 else 0
+    # A negative *treatment* delta is the one outcome this script is built to
+    # catch, so it is worth a non-zero exit: a CI job or a pipeline can gate on
+    # it. The pooled delta is deliberately not used here — the first measured run
+    # had a negative pooled delta with a non-negative treatment, and exiting on
+    # the pooled number would have failed the pipeline over sampling noise in
+    # tasks the steering rule never touched. Zero is not an error either; it has
+    # innocent explanations, listed above.
+    return 1 if delta_moved < 0 else 0
 
 
 if __name__ == "__main__":
