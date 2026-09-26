@@ -760,8 +760,15 @@ RSI 循环本身在默认模式下不需要模型，所以生成器、四道闸�
 `batch source : .../batch_steered.json`，然后在模型加载之前停下。
 
 `pipeline.sh` 默认就跑这个顺序；当第 3 步什么都没移动时，第 4 步的重扫会被跳过
-（那时 steer 后的文件是原批次的副本，已有的扫描恰好描述它）。`APPLY_CURRICULUM=0` 只规划不施加；
-`STEER_AND_RESCAN=0` 施加但在 steer 之前的批次上训练；`TRAIN_ON_BATCH=0` 退回在随仓库发布的套件上训练。
+（那时 steer 后的文件是原批次的副本，已有的扫描恰好描述它）——但**报告不会被跳过**，
+因为「零移动」本身也是一个结论。没有移动时，after 批次就是 before 批次，对着它自己的扫描比，
+delta 恒为 `0`，这是算术恒等式而不是「测出来批次位置很好」；产物把这个区别记成
+`delta_is_evidence: false`，让这个数字无法脱离它的限定条件被引用。
+
+`APPLY_CURRICULUM=0` 只规划不施加；`STEER_AND_RESCAN=0` 施加但在 steer 之前的批次上训练；
+`TRAIN_ON_BATCH=0` 退回在随仓库发布的套件上训练；`TAG_SUFFIX=-steer` 把 checkpoint 重定向到
+`train-*-steer/`、把评测重定向到 `eval_ablation-steer.json`，这样第二次运行不会覆盖第一次的产物——
+`eval_ablation.json` 会被 `tools/plot.py` 读去画 fig13，覆盖它会**静默改变一个已提交的图**。
 
 `run.sh` 是受支持的入口，不是便利脚本。它会设置 `APPDATA`、HuggingFace 缓存目录并清掉
 `PYTHONPATH`，因为在 Windows 上这三者配错时给出的都是**误导性**报错而不是缺依赖报错——

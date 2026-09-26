@@ -950,12 +950,22 @@ batch identical to its input — a correct no-op that looks like a working
 curriculum. Step 5's `--dry-run` proves the wiring for free: it prints
 `batch source : .../batch_steered.json` and stops before the model loads.
 
-`pipeline.sh` runs exactly this order by default, and the rescan in step 4 is
+`pipeline.sh` runs exactly this order by default. The rescan in step 4 is
 skipped when step 3 moved nothing (the steered file is then a copy of the
-original, which the existing scan already describes). `APPLY_CURRICULUM=0`
-plans the curriculum without applying it; `STEER_AND_RESCAN=0` applies it but
-trains on the pre-steer batch; `TRAIN_ON_BATCH=0` restores training on the
-shipped suite.
+original, which the existing scan already describes) — but the **report is not**
+skipped, because a zero-move plan is a result too. With no moves the "after"
+batch is the "before" batch compared against its own scan, so the delta is `0`
+for arithmetic reasons rather than because the batch was measured to be
+well-placed; the artifact records that as `delta_is_evidence: false` so the
+number cannot be quoted without its caveat.
+
+`APPLY_CURRICULUM=0` plans the curriculum without applying it;
+`STEER_AND_RESCAN=0` applies it but trains on the pre-steer batch;
+`TRAIN_ON_BATCH=0` restores training on the shipped suite; `TAG_SUFFIX=-steer`
+redirects the checkpoints to `train-*-steer/` and the evaluation to
+`eval_ablation-steer.json`, so a second run cannot overwrite the first one's
+artifacts — `eval_ablation.json` is read by `tools/plot.py` for fig13, and
+clobbering it would silently change a committed figure.
 
 `run.sh` is the supported entry point, not a convenience. It sets `APPDATA`, the
 HuggingFace cache, and clears `PYTHONPATH`, because on Windows each of those
