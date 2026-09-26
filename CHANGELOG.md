@@ -221,6 +221,32 @@ before it.
   `tests/test_rsi_steered_batch.py` pins all of it, including the sign of the
   report's delta under a swapped before/after. `test_rsi_closed_loop.py` gained
   the pipeline-ordering assertions for the new hop.
+- **The first measured closed loop found a defect in the report that measured it
+  — the treatment and the control were pooled.** The pooled delta came back
+  negative (`-0.0031`) and the script's verdict was that the steering rule moved
+  tasks the wrong way. Decomposed per task, every one of the 8 replaced tasks had
+  a non-negative delta (`+0.0033` on three, exactly `0` on five); the whole
+  negative came from three tasks **nobody touched** (`58/256 → 54/256` on
+  `t1-9ea9b3bc`, and two smaller drifts). The kept tasks are the *same task
+  measured twice*, so they are a free control group and their movement is the
+  noise floor at `n=64` — pooling it into the headline let sampling noise decide
+  the sign of the one number the script reports as a defect.
+
+  `loop_report.py` now reports three numbers and rests its verdict and its exit
+  code on the treatment: `alignment_delta` (pooled, kept for continuity with the
+  printed table), `alignment_delta_moved` (**the treatment effect**), and
+  `alignment_delta_kept` (the control — the scale the treatment must clear, never
+  a result). A sign disagreement between pooled and treatment is now stated
+  explicitly rather than silently resolved.
+
+  The honest reading of the first closed loop is therefore **direction right,
+  step too small**: all 8 moves went `out_of_reach → easier`, but the batch did
+  not move (`out_of_reach 11 → 11`, `frontier 1 → 1`) and the treatment effect
+  (`+0.0012`) is an order of magnitude *below* the control noise (`-0.0119`), so
+  the rule is not distinguishable from noise at this `n`. `band.steer` halves
+  `payload_len`, drops `escape_density` by `0.2` and `steps` by one, which does
+  not lift a task off a floor where the 0.5B policy scores 0/256 at the *easiest*
+  parameter setting. That is a statement about the step size, not the direction.
 - **`band.steer` left the largest difficulty lever untouched.** The
   "make this easier" rule moved `payload_len`, `escape_density`, `steps` and
   `read_source` but not `verify_mode` — and `python_exit` carries a full `1.0` of

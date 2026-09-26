@@ -373,6 +373,11 @@ def test_pipeline_scans_the_batch(tmp: Path) -> None:
         "the tag names the checkpoint dir and the eval reads it back by tag",
     )
     check(
+        "a run that stopped after the rescan can reuse it",
+        'SKIP_STEERED_SCAN:-0' in src,
+        "a rescan is ~30 GPU-minutes; a crash in the report must not repay it",
+    )
+    check(
         "N_SCAN defaults above the band-resolution floor",
         'N_SCAN="${N_SCAN:-64}"' in src,
         "below 35 a zero-pass cell is unresolved and the curriculum goes inert",

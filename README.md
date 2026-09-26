@@ -670,8 +670,59 @@ The fix has three parts, and the third is the one that makes it a loop:
 `scripts/loop_report.py` then reports the before/after alignment. It is the only
 number in the repository that the task axis produces and that **could come out
 negative** — every other check is a pass/fail on well-formedness, and a suite of
-pass/fail checks cannot detect a curriculum that moves tasks the wrong way. It
-exits non-zero when it does.
+pass/fail checks cannot detect a curriculum that moves tasks the wrong way.
+
+**The first measured run found a defect in the report itself, and the artifacts
+are what caught it.** The pooled delta came back negative (`-0.0031`) and the
+script's verdict was that the steering rule was moving tasks the wrong way. It
+was not. Decomposed per task, every one of the 8 replaced tasks had a
+non-negative delta (`+0.0033` on three, exactly `0` on five), and the entire
+negative came from three tasks **nobody touched**:
+
+| task | moved? | before | after | Δα-reward |
+| --- | --- | --- | --- | --- |
+| `t2-4f700c89` | yes | 0/256 | 1/256 | **+0.0033** |
+| `t4-57df3039` | yes | 0/256 | 1/256 | **+0.0033** |
+| `t1-b6c10153` | yes | 0/256 | 1/256 | **+0.0033** |
+| `t1-9ea9b3bc` | no | 58/256 | 54/256 | **−0.0398** |
+| `t1-8f87ad9e` | no | 11/256 | 10/256 | **−0.0044** |
+| `t3-7e98aba7` | no | 1/256 | 0/256 | **−0.0033** |
+
+The kept tasks are not part of the treatment. They are the *same task measured
+twice*, so their movement is a free control group — the noise floor at `n=64` —
+and pooling it into the headline let sampling noise decide the sign of the number
+the script reports as a defect. A task drifting `58/256 → 54/256` with no
+intervention is not evidence about the steering rule.
+
+The report now computes and prints three numbers and rests its verdict on the
+middle one:
+
+| number | what it is |
+| --- | --- |
+| `alignment_delta` | pooled — kept for continuity with the printed table |
+| `alignment_delta_moved` | **the treatment effect** — what the rule is answerable for |
+| `alignment_delta_kept` | the control — the scale the treatment must clear, never a result |
+
+A sign disagreement between the pooled and treatment numbers is now stated
+explicitly rather than silently resolved. On the real run the script prints, and
+exits `0` on:
+
+```
+  alignment    : before 0.1185  ->  after 0.1153   delta -0.0031   (whole batch)
+  moved delta  : +0.0012   over 8 replaced tasks   (treatment)
+  kept  delta  : -0.0119   over 4 untouched tasks   (control — same task twice)
+```
+
+**So the honest reading of the first closed loop is this: the direction is
+right and the step is too small.** All 8 moves went `out_of_reach → easier`,
+which is the direction the band definition asks for. But the batch did not move
+— `out_of_reach 11 → 11`, `frontier 1 → 1` — and the treatment effect
+(`+0.0012`) is an order of magnitude *below* the control noise (`-0.0119`). The
+steering rule is therefore not distinguishable from the noise floor at this
+`n`, and the number that says so is the step size (a single step per knob), not
+the direction. `band.steer` moves `payload_len` to half, `escape_density` down
+`0.2`, `steps` down one — which is not enough to lift a task off a floor where
+the 0.5B policy scores 0/256 at the *easiest* parameter setting.
 
 A zero from that script is also diagnosed rather than printed bare. `move_count:
 0` has three causes needing three different responses, and only the first was

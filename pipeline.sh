@@ -34,6 +34,7 @@
 #   STEER_AND_RESCAN=0 bash pipeline.sh   # apply, but train on the pre-steer batch
 #   TRAIN_ON_BATCH=0 bash pipeline.sh     # train on the shipped suite instead
 #   TAG_SUFFIX=-steer bash pipeline.sh    # write train-*-steer/ instead of overwriting
+#   SKIP_STEERED_SCAN=1 bash pipeline.sh  # reuse an existing rescan of the steered batch
 #
 # TAG_SUFFIX exists so a second full run can be made without destroying the
 # first one's checkpoints. The tag decides the output directory, and the
@@ -217,9 +218,20 @@ if [ "${STEER_AND_RESCAN:-1}" = "1" ] && [ "$APPLY" = "1" ]; then
   AFTER_SCAN="$CURRICULUM_SCAN"
 
   if [ "${STEERED_MOVED:-0}" -gt 0 ]; then
-    echo "-- $STEERED_MOVED task(s) moved -> scanning the steered batch and training on IT"
-    bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch_steered.json" \
-      --n "$N_SCAN" --out "$OUT/rsi/scan_batch_steered.json"
+    # SKIP_STEERED_SCAN reuses a rescan that already exists. It is not a
+    # convenience: a scan is ~30 minutes of GPU on this batch, and the one case
+    # that most needs it -- a run that stopped *after* the rescan, in the report
+    # or in training -- is exactly the case where paying for it twice teaches
+    # nothing. Reusing it is safe because the batch it measures is on disk and
+    # the scan names the ids it measured; the overlap guard below re-checks that
+    # the two still agree rather than trusting the file's existence.
+    if [ "${SKIP_STEERED_SCAN:-0}" = "1" ] && [ -f "$OUT/rsi/scan_batch_steered.json" ]; then
+      echo "-- SKIP_STEERED_SCAN=1 and the rescan exists -> reusing it"
+    else
+      echo "-- $STEERED_MOVED task(s) moved -> scanning the steered batch and training on IT"
+      bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch_steered.json" \
+        --n "$N_SCAN" --out "$OUT/rsi/scan_batch_steered.json"
+    fi
     TRAIN_BATCH_PATH="$OUT/rsi/batch_steered.json"
     TRAIN_SCAN_PATH="$OUT/rsi/scan_batch_steered.json"
     AFTER_SCAN="$TRAIN_SCAN_PATH"
