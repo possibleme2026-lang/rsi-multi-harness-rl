@@ -13,9 +13,12 @@
 #   1. smokes          correctness gates; abort before any GPU time
 #   2. scan            measures pass rates for every (harness, task) cell,
 #                      which train.py needs to drop zero-gradient rows
-#   3. curriculum      generates the batch, scans THAT batch, then steers it;
-#                      with APPLY_CURRICULUM=1 it also regenerates the flagged
-#                      tasks and gates them
+#   3. curriculum      generates the batch, scans THAT batch, steers it,
+#                      regenerates the flagged tasks, scans the STEERED batch,
+#                      and reports the alignment before/after. The rescan is the
+#                      step that makes the axis closed rather than merely wired:
+#                      without it the curriculum's output stops at a file and
+#                      the training arms read the pre-steer batch.
 #   4. train single    baseline arm: one harness, free to overfit it
 #   5. train multi     treatment arm: four harnesses, cannot
 #   6. eval            baseline + both arms, on held-out tasks AND the
@@ -27,15 +30,23 @@
 #   SKIP_SCAN=1 bash pipeline.sh          # reuse an existing scan
 #   SKIP_BATCH_SCAN=1 bash pipeline.sh    # reuse an existing scan of the batch
 #   SKIP_TRAIN=1 bash pipeline.sh         # re-evaluate existing checkpoints
-#   APPLY_CURRICULUM=1 bash pipeline.sh   # also regenerate the flagged tasks
+#   APPLY_CURRICULUM=0 bash pipeline.sh   # plan the curriculum but do not apply
+#   STEER_AND_RESCAN=0 bash pipeline.sh   # apply, but train on the pre-steer batch
 #   TRAIN_ON_BATCH=0 bash pipeline.sh     # train on the shipped suite instead
 #
 # Stage 3 is the one that closes the loop, and the ordering in it is the
 # mechanism rather than a detail: a batch has to exist before it can be
-# measured, and measured before it can be steered. Earlier releases generated
-# the batch and steered it with a scan of the shipped suite, which shares no
-# task ids, so the curriculum correctly reported zero moves on every run while
-# the training arms never saw a generated task at all.
+# measured, measured before it can be steered, and steered before it can be
+# trained on. Each of those three orderings was missing in turn, and each time
+# the loop looked wired while nothing reached the gradient.
+#
+# N_SCAN is 64 rather than 8 because of arithmetic, not taste. A band is only
+# assigned when the whole Wilson interval falls inside one band, and the
+# out-of-reach boundary is 0.1: a cell with zero passes needs n >= 35 before its
+# upper bound drops below that, and 64 before it does so with room to spare.
+# Below 35 every cell is `unresolved`, the plan holds every task, and the
+# curriculum reports zero moves for a reason that has nothing to do with the
+# tasks. The stage prints a warning when N_SCAN is below the threshold.
 
 set -euo pipefail
 
@@ -43,10 +54,25 @@ cd "$(dirname "$0")"
 
 RUN=./run.sh
 STEPS="${STEPS:-40}"
-N_SCAN="${N_SCAN:-8}"
+# 64, not 8: see the header. Below 35 the curriculum cannot place a zero-pass
+# cell in any band, so every task is held and the axis is inert.
+N_SCAN="${N_SCAN:-64}"
 N_EVAL="${N_EVAL:-4}"
 OUT="${MULTIHARNESS_OUT:-$PWD/outputs}"
 mkdir -p "$OUT"
+
+# The threshold is a property of the band definition (out-of-reach is p < 0.1)
+# and the Wilson interval, not a tunable. Restated here so a reader who lowers
+# N_SCAN sees why the curriculum went quiet, rather than concluding the tasks
+# are on target.
+N_SCAN_MIN_FOR_BANDS=35
+if [ "$N_SCAN" -lt "$N_SCAN_MIN_FOR_BANDS" ]; then
+  echo "WARNING: N_SCAN=$N_SCAN is below $N_SCAN_MIN_FOR_BANDS." >&2
+  echo "         A zero-pass cell's Wilson upper bound is z^2/(n+z^2), which stays" >&2
+  echo "         above the 0.1 out-of-reach boundary until n >= $N_SCAN_MIN_FOR_BANDS." >&2
+  echo "         Every cell will be 'unresolved', the curriculum will hold every" >&2
+  echo "         task, and its zero moves will describe the scan and not the tasks." >&2
+fi
 
 # Read the train split from the suite rather than repeating it here. A literal
 # copy drifts the moment a task is added: the scan would keep measuring 16 cells
@@ -135,10 +161,74 @@ if not overlap:
 PY
 
 CURRICULUM_ARGS=(--task-batch "$TASK_BATCH" --seed "$BATCH_SEED" --scan "$CURRICULUM_SCAN")
-if [ "${APPLY_CURRICULUM:-0}" = "1" ]; then
+APPLY="${APPLY_CURRICULUM:-1}"
+if [ "$APPLY" = "1" ]; then
   CURRICULUM_ARGS+=(--apply-curriculum)
 fi
 bash "$RUN" scripts/rsi_loop.py "${CURRICULUM_ARGS[@]}"
+
+# ---- the step that closes the loop -----------------------------------------
+# `--apply-curriculum` writes the steered batch to batch_steered.json. Until this
+# stage read it back, the regenerated tasks stopped at that file: the curriculum
+# moved a task, the four gates confirmed the replacement was solvable, and the
+# training arms went on reading `batch.json`. Reachable, never reached.
+#
+# So the steered batch is scanned and becomes the training input. It has to be
+# scanned rather than reused because the ids are new — a reparameterised task is
+# a different task, and its predecessor's pass rate says nothing about it. The
+# signal filter would find no measurement for any row and keep them all, which
+# is the silent state `--require-signal` exists to refuse.
+#
+# When nothing moved, batch_steered.json is a copy of batch.json and the
+# existing scan still describes it exactly, so the rescan is skipped rather than
+# paid for. The decision is read from the artifact, not inferred from a log line.
+TRAIN_BATCH_PATH="$OUT/rsi/batch.json"
+TRAIN_SCAN_PATH="$CURRICULUM_SCAN"
+STEERED_MOVED="$(bash "$RUN" - "$OUT/rsi/curriculum.json" <<'PY'
+import json, sys
+try:
+    cur = json.loads(open(sys.argv[1], encoding="utf-8").read())
+except Exception:
+    print(0); raise SystemExit
+print(int(cur.get("steered", {}).get("moved", 0)))
+PY
+)"
+
+if [ "${STEER_AND_RESCAN:-1}" = "1" ] && [ "$APPLY" = "1" ] && [ "${STEERED_MOVED:-0}" -gt 0 ]; then
+  echo "-- $STEERED_MOVED task(s) moved -> scanning the steered batch and training on IT"
+  bash "$RUN" scripts/probe.py --from-batch "$OUT/rsi/batch_steered.json" \
+    --n "$N_SCAN" --out "$OUT/rsi/scan_batch_steered.json"
+  TRAIN_BATCH_PATH="$OUT/rsi/batch_steered.json"
+  TRAIN_SCAN_PATH="$OUT/rsi/scan_batch_steered.json"
+
+  # Same guard as above, for the same reason: the steered batch carries new
+  # hashed ids, and a scan that misses them would train on unmeasured rows.
+  bash "$RUN" - "$TRAIN_SCAN_PATH" "$TRAIN_BATCH_PATH" <<'PY'
+import json, sys
+scan = json.loads(open(sys.argv[1], encoding="utf-8").read())
+batch = json.loads(open(sys.argv[2], encoding="utf-8").read())
+scan_ids = {str(r.get("task_id")) for r in scan.get("records", [])}
+batch_ids = {str(t["id"]) for t in batch}
+overlap = scan_ids & batch_ids
+print(f"steered scan ids {len(scan_ids)}  batch ids {len(batch_ids)}  overlap {len(overlap)}")
+if not overlap:
+    sys.exit(f"FATAL: {sys.argv[1]} measures none of the {len(batch_ids)} steered ids")
+PY
+
+  # The before/after comparison. This is the only number in the repository that
+  # the task axis produces and that could come out negative.
+  bash "$RUN" scripts/loop_report.py \
+    --before-batch "$OUT/rsi/batch.json" \
+    --before-scan "$CURRICULUM_SCAN" \
+    --after-batch "$OUT/rsi/batch_steered.json" \
+    --after-scan "$TRAIN_SCAN_PATH" \
+    --out "$OUT/rsi/loop_closed.json"
+elif [ "${STEERED_MOVED:-0}" -eq 0 ]; then
+  echo "-- no tasks moved (see move_diagnosis in curriculum.json) -> reusing the scan"
+  echo "   the steered batch is a copy of the original, so the same scan describes it"
+else
+  echo "STEER_AND_RESCAN=$STEER_AND_RESCAN or APPLY_CURRICULUM=$APPLY -> training on the pre-steer batch"
+fi
 
 if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   # Training reads the same scan the curriculum steered on, and the batch it
@@ -146,11 +236,14 @@ if [ "${SKIP_TRAIN:-0}" != "1" ]; then
   # that matched nothing -- 64 rows over 128 steps is 16 epochs, which is
   # memorisation, and the flat reward curve past step 65 was that and not a
   # capability limit.
+  #
+  # TRAIN_BATCH_PATH / TRAIN_SCAN_PATH were decided in stage 3: the steered
+  # batch when the curriculum moved something, the original otherwise.
   TRAIN_BATCH_ARGS=()
   TRAIN_SCAN_ARGS=()
   if [ "${TRAIN_ON_BATCH:-1}" = "1" ]; then
-    TRAIN_BATCH_ARGS=(--batch "$OUT/rsi/batch.json" --require-signal)
-    TRAIN_SCAN_ARGS=(--scan "$CURRICULUM_SCAN")
+    TRAIN_BATCH_ARGS=(--batch "$TRAIN_BATCH_PATH" --require-signal)
+    TRAIN_SCAN_ARGS=(--scan "$TRAIN_SCAN_PATH")
   else
     echo "TRAIN_ON_BATCH=0 -> training on the shipped suite with $OUT/scan_all.json"
     TRAIN_SCAN_ARGS=(--scan "$OUT/scan_all.json")

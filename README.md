@@ -1,14 +1,16 @@
 # rsi-multi-harness-rl
 
-**Recursive self-improvement for agentic RL: the tasks, the reward, and the
-harness are all built by the system, then checked by gates that can fail.**
+**Recursive self-improvement for agentic RL: the tasks, the reward, the harness,
+and the environment are all built by the system, then checked by gates that can
+fail.**
 
 A policy is trained inside an *agent harness*. This repository asks what happens
 when the harness is not a fixed product decision — when the system **generates
-its own tasks, writes its own reward function, and evolves its own harness**,
-keeping only the changes that clear a measured noise floor.
+its own tasks, writes its own reward function, evolves its own harness, and
+synthesises the environment the agent acts on**, keeping only the changes that
+clear a measured noise floor.
 
-Three things are self-constructed here, and each one is validated rather than
+Four things are self-constructed here, and each one is validated rather than
 asserted:
 
 | axis | built by | checked by | evidence |
@@ -16,6 +18,7 @@ asserted:
 | **task** | `rsi/task_gen.py` | gates V1–V4 | `outputs/rsi/validation.json` |
 | **reward** | `rsi/verifier_gen.py` | V1 never fires / V2 always fires | same artifact, per-gate |
 | **harness** | `rsi/harness_evolve.py` | noise floor + tool-surface guard | `outputs/rsi/ledger.jsonl` |
+| **environment** | `rsi/envgen.py` | discriminability + Harbor export | `outputs/rsi/env_validation.json` |
 
 [中文说明](README.zh-CN.md)
 
@@ -282,6 +285,70 @@ written inside a markdown fence, which the parser does not accept.
 
 The floor is the policy's, not the harness's. Reporting this gap as a measured
 generalization number would be reporting `0 == 0`.
+
+## Axis 4 — the environment is synthesised, not assumed
+
+The first three axes generate a task, its reward, and the harness it runs in.
+All three still assume the thing the agent *acts on* — a filesystem with a few
+files in it, where every action is a shell command whose effect is visible only
+in its stdout. That is the easiest possible world to train in and the least like
+the ones agents are deployed into.
+
+`rsi/envgen.py` builds the missing half: a **stateful environment** with its own
+tool surface. The generated task ships three artifacts rather than a prompt —
+
+* a `tools.py` the agent calls from its shell, so the environment is manipulated
+  through a real CLI rather than by editing files;
+* an `initial_state.json` holding the world the task starts from;
+* an `envtool` shim placed on `PATH`, which relocates the state per rollout.
+
+The reward changes shape with it. A string task is scored by comparing a file,
+which is binary. An environment task is scored by `state_checkpoints` — a list of
+predicates over the resulting world state — so the reward is a **fraction**, and
+an agent that gets three of four checkpoints right scores 0.75 rather than 0.
+That is a different training signal from anything the first three axes produce,
+and it is the reason the axis exists rather than being folded into axis 1.
+
+**What is verified.** Two independent checks, both in CI and neither needing a
+model:
+
+| check | artifact | result |
+| --- | --- | --- |
+| every synthesised environment discriminates | `outputs/rsi/env_validation.json` | 30/30 `discriminable` |
+| every one exports as a runnable Harbor package | `outputs/rsi/harbor_local.json` | 30/30 ok |
+
+"Discriminable" is the property that matters: a generated environment is useless
+if the reference solution and a plausible-wrong solution produce the same state,
+because then the checkpoints cannot tell success from failure. The gate applies
+the reference trace and a mutated one and requires the scores to differ.
+
+**What is measured.** `outputs/rsi/env_scan.json` is a scan of 12 generated
+environments across 4 harnesses at `n = 2`, pooled: **0/96**, Wilson
+`[0, 0.0385]`, verdict `dead`. That is a genuine floor rather than an
+under-measurement — `0.0385` is below the `0.05` signal floor, so the scan
+excludes any pass rate above it. Two of the 96 rollouts scored partial credit
+(0.4 and 0.2), which is exactly the fractional reward behaving as designed: the
+policy is not shut out, it is failing the later checkpoints.
+
+Read together with axis 1, the two axes fail differently and that difference is
+the finding. A generated *string* batch measured `0/16` at `n = 2`, upper bound
+`0.1936` — `under_measured`, overlapping the shipped suite's easiest tier, so it
+supports no claim about the generator. The *environment* batch measured `0/96`,
+which does. The environment axis is the stronger of the two pieces of evidence
+that the generator's output sits below what a 0.5B policy can reach.
+
+**Known limitation — the curriculum cannot steer this axis yet.** The steering
+rule moves a *parameter vector*, and `curriculum.plan_regeneration` requires a
+`params` key on the task dict. Environment tasks do not carry one: they have
+`domain`, `difficulty` and `checkpoint_count` instead, because they are built
+from a spec rather than sampled from `PARAM_SPACE`. So every environment task
+falls through to `held` with the reason "no parameters for this task id", and the
+difficulty knobs that do exist — `n_records`, `n_distractors`, `n_steps` — are
+passed as constants for a whole batch rather than varying within it.
+`envgen.reparameterise_env` was written for this and has no call site; its own
+docstring says it is "the call site the curriculum needs once it is steering
+environments rather than strings." Wiring it is the next axis of work, and until
+it is wired the environment axis is generated and measured but not **steered**.
 
 ## The gates, and why there are four
 
@@ -563,6 +630,68 @@ Whether that is too hard is the open question, and it is answerable by one scan
 of a generated batch at `n >= 32`. Until that exists, the honest statement is
 that the generator's calibration is unmeasured, not that it is wrong.
 
+**And a third correction, because the second one stopped one hop short.** The
+paragraph above said the loop "was reachable; it was not *reached*" and that
+fixing the ordering closed it. That was true of the *first* hop and false of the
+last one. Ordering the pipeline correctly made the scan measure the batch, and
+made `--require-signal` refuse a scan that did not — so a generated task could
+reach the gradient. What still could not was a **steered** task:
+
+```
+curriculum.plan_regeneration  ->  moves
+execute_plan                  ->  fresh tasks
+curriculum.json               <-  written here, and read by nobody
+```
+
+`rsi_loop.py` wrote the regenerated tasks into `curriculum.json` and stopped.
+`batch.json` was never rewritten, so the training arms read the *pre-steer*
+batch — and the artifact said so, in its own words:
+
+> `measured_effect`: "none — the regenerated batch is gate-valid, which is a
+> solvability claim. Whether it moved toward alpha needs a rescan of these
+> tasks."
+
+That rescan was never run, and no script could have run it, because nothing knew
+the steered batch existed. A run could therefore move every task in the batch,
+pass all four gates on every replacement, and not change a single gradient. This
+is the same defect for the third time — a mechanism that exists, passes its
+tests, and is never reached by the thing it was built for — after the missing
+`steer` call site and the trainer's hardcoded task list.
+
+The fix has three parts, and the third is the one that makes it a loop:
+
+1. `curriculum.steered_batch(plan, batch)` returns the batch with moved tasks
+   replaced and everything else kept, preserving length, order and ids.
+2. `rsi_loop.py --apply-curriculum` writes it to `rsi/batch_steered.json` — for
+   every apply, including a zero-move one, so downstream has one path.
+3. `pipeline.sh` scans that file and hands **it** to the trainer, so the
+   curriculum's output is what the gradient sees.
+
+`scripts/loop_report.py` then reports the before/after alignment. It is the only
+number in the repository that the task axis produces and that **could come out
+negative** — every other check is a pass/fail on well-formedness, and a suite of
+pass/fail checks cannot detect a curriculum that moves tasks the wrong way. It
+exits non-zero when it does.
+
+A zero from that script is also diagnosed rather than printed bare. `move_count:
+0` has three causes needing three different responses, and only the first was
+ever visible:
+
+| diagnosis | meaning | response |
+| --- | --- | --- |
+| `ids_mismatch` | the scan measures a different task set | scan the batch you intend to steer |
+| `all_unresolved` | every interval spans two bands | scan more — this is about the measurement, not the tasks |
+| `all_frontier` | every cell is where training should happen | nothing to do; the batch is on target |
+
+The middle row is the one that used to hide, and it is a live risk rather than a
+hypothetical: a band is assigned only when the whole Wilson interval falls inside
+it, and the out-of-reach boundary is `0.1`, so a zero-pass cell needs **n ≥ 35**
+before it can be placed at all (`hi = z²/(n+z²)`; `2/64 → 0.0955` places,
+`3/64 → 0.1182` does not). `N_SCAN` therefore defaults to 64 rather than 8, and
+the pipeline warns when it is set below the threshold — because the failure mode
+of a too-small scan is a curriculum that reports "0 moves" in a way that reads
+exactly like "the batch is already perfect".
+
 ## Figures
 
 All thirteen are regenerated from recorded artifacts by `./run.sh tools/plot.py`,
@@ -658,6 +787,15 @@ help", which is not.
 
 One process, one seed (42), shared harness instances, 5 harnesses × 8 held-out
 tasks × 4 rollouts = **160 rollouts per arm, 480 total**. `n = 4` per cell.
+
+**These numbers predate the current `eval.py`, and the direction survives the
+change.** `outputs/eval_ablation.json` was produced before `e1f0b07`, when the
+script ranked arms by gap; that ranking was removed because the held-out term is
+an identity (see above), and the same artifact now reads `INCONCLUSIVE` with a
+one-sided bound instead. The train and held-out figures below are unchanged —
+the fix moved no number, which the repository's own `CHANGELOG` records — so the
+conclusions drawn from them stand. What changed is the *claim* the script is
+willing to make from them.
 
 | arm | train-harness reward | held-out reward | gap |
 | --- | --- | --- | --- |
@@ -779,22 +917,45 @@ the four gates, and the harness evolution can all be exercised on CPU:
 ```
 
 The closed loop has a CPU-only path too, and it is the cheapest way to check the
-wiring after touching any of the four stages:
+wiring after touching any of the five stages:
 
 ```bash
 # 1. write the batch (deterministic in --seed)
 ./run.sh scripts/rsi_loop.py --batch-only --task-batch 12 --env-batch 4 --seed 11
-# 2. measure it -- this is the step that closes the loop
+# 2. measure it -- this is the step that makes the curriculum possible
 ./run.sh scripts/probe.py --from-batch outputs/rsi/batch.json \
-    --n 32 --out outputs/rsi/scan_batch.json
-# 3. check what training would consume, without loading a model
+    --n 64 --out outputs/rsi/scan_batch.json
+# 3. steer it: regenerate the flagged tasks and write the steered batch
+./run.sh scripts/rsi_loop.py --task-batch 12 --seed 11 \
+    --scan outputs/rsi/scan_batch.json --apply-curriculum
+# 4. measure the steered batch -- the ids are new, so the old scan cannot cover them
+./run.sh scripts/probe.py --from-batch outputs/rsi/batch_steered.json \
+    --n 64 --out outputs/rsi/scan_batch_steered.json
+# 5. check what training would consume, without loading a model
 ./run.sh scripts/train.py --mode multi --steps 1 \
-    --batch outputs/rsi/batch.json --scan outputs/rsi/scan_batch.json \
+    --batch outputs/rsi/batch_steered.json --scan outputs/rsi/scan_batch_steered.json \
     --require-signal --dry-run
+# and the one number that could come out negative
+./run.sh scripts/loop_report.py \
+    --before-batch outputs/rsi/batch.json --before-scan outputs/rsi/scan_batch.json \
+    --after-batch outputs/rsi/batch_steered.json \
+    --after-scan outputs/rsi/scan_batch_steered.json
 ```
 
-`pipeline.sh` runs exactly this order by default. `TRAIN_ON_BATCH=0` restores the
-older behaviour of training on the shipped suite.
+`--n 64` is not a preference. A band is assigned only when the whole Wilson
+interval falls inside it, and the out-of-reach boundary is `0.1`, so a cell with
+zero passes needs **n ≥ 35** before it can be placed at all. Below that every
+cell is `unresolved`, the plan holds every task, and step 3 writes a steered
+batch identical to its input — a correct no-op that looks like a working
+curriculum. Step 5's `--dry-run` proves the wiring for free: it prints
+`batch source : .../batch_steered.json` and stops before the model loads.
+
+`pipeline.sh` runs exactly this order by default, and the rescan in step 4 is
+skipped when step 3 moved nothing (the steered file is then a copy of the
+original, which the existing scan already describes). `APPLY_CURRICULUM=0`
+plans the curriculum without applying it; `STEER_AND_RESCAN=0` applies it but
+trains on the pre-steer batch; `TRAIN_ON_BATCH=0` restores training on the
+shipped suite.
 
 `run.sh` is the supported entry point, not a convenience. It sets `APPDATA`, the
 HuggingFace cache, and clears `PYTHONPATH`, because on Windows each of those
@@ -819,13 +980,22 @@ is 2,048 rollouts; training and evaluation are longer.
 | script | what it does |
 | --- | --- |
 | `scripts/probe.py` | capability probe + difficulty scan, writes `scan_all.json` |
-| `scripts/rsi_loop.py` | both RSI axes: generate + gate tasks, evolve harnesses |
+| `scripts/rsi_loop.py` | all four RSI axes; `--batch-only` writes a batch, `--apply-curriculum` writes the steered one |
+| `scripts/loop_report.py` | the before/after alignment — the task axis's one falsifiable number |
 | `scripts/train.py` | one arm of the ablation (`--mode single` / `--mode multi`) |
 | `scripts/eval.py` | baseline + both arms in one process, prints the ablation |
 | `scripts/diag.py` | full un-truncated transcript for one (harness, task) |
 | `scripts/errs_report.py` | classifies scan tool errors: harness defect vs model behaviour |
 | `scripts/guard_tool_surface.py` | advertised tools must equal implemented tools |
 | `scripts/merge_scan.py` | fold a partial rescan into an old dump, with invariant checks |
+| `scripts/harness_solvability.py` | Gate V1 through each harness's *own* tools, not the oracle's |
+| `scripts/env_batch_make.py` | synthesise an environment batch so it is reproducible from a command |
+| `scripts/env_harness_smoke.py` | drive environment tasks through real harnesses with a scripted policy |
+| `scripts/env_reward_ceiling.py` | prove the reward path reaches 1.0 without a model |
+| `scripts/env_scan_report.py` | funnel each environment rollout to the stage where it stopped |
+| `scripts/env_spread_significance.py` | is a cross-harness spread signal, or two lucky samples? |
+| `scripts/guidance_shape_check.py` | does guidance change the *shape* of the tool calls it produces? |
+| `scripts/harbor_local_run.py` | run an exported Harbor package without Docker |
 
 ## Layout
 

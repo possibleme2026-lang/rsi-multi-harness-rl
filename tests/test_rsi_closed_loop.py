@@ -284,6 +284,11 @@ def test_pipeline_scans_the_batch(tmp: Path) -> None:
     absence reopened the loop — the batch is generated before it is scanned, the
     scan is of the batch, and the curriculum and the trainer read that same
     scan.
+
+    The second half pins the *last* hop: the steered batch is scanned and becomes
+    the training input. Without it the curriculum moved a task, wrote the result
+    to a file, and the training arms went on reading the pre-steer batch — the
+    loop was wired and never closed.
     """
     print("\n-- pipeline.sh orders generation, scan, steering correctly")
 
@@ -302,8 +307,8 @@ def test_pipeline_scans_the_batch(tmp: Path) -> None:
         'CURRICULUM_SCAN="$OUT/rsi/scan_batch.json"' in src,
     )
     check(
-        "training reads the same scan the curriculum steered on",
-        '"${TRAIN_SCAN_ARGS[@]}"' in src and 'TRAIN_SCAN_ARGS=(--scan "$CURRICULUM_SCAN")' in src,
+        "training reads the scan of whatever batch it trains on",
+        '"${TRAIN_SCAN_ARGS[@]}"' in src and 'TRAIN_SCAN_ARGS=(--scan "$TRAIN_SCAN_PATH")' in src,
     )
     check(
         "training on the generated batch is the default",
@@ -313,6 +318,47 @@ def test_pipeline_scans_the_batch(tmp: Path) -> None:
     check(
         "an id mismatch is fatal rather than a silent zero-move plan",
         "measures none of the" in src,
+    )
+
+    # -- the last hop: the steered batch reaches the trainer ------------------
+    i_steered_scan = src.find("--from-batch \"$OUT/rsi/batch_steered.json\"")
+    i_train = src.find("scripts/train.py")
+    check("the steered batch is scanned", i_steered_scan > 0)
+    check("the steered scan precedes training", 0 < i_steered_scan < i_train)
+    check(
+        "the steered scan is ordered after the steer that produces it",
+        0 < i_steer < i_steered_scan,
+    )
+    check(
+        "training can read the steered batch",
+        'TRAIN_BATCH_PATH="$OUT/rsi/batch_steered.json"' in src,
+        "the curriculum's output has to be reachable by the trainer",
+    )
+    check(
+        "the rescan decision is read from the artifact, not inferred from a log",
+        'cur.get("steered", {}).get("moved", 0)' in src,
+    )
+    check(
+        "applying the curriculum is the default",
+        'APPLY_CURRICULUM:-1' in src,
+        "a curriculum that is planned but never applied cannot move a gradient",
+    )
+    check(
+        "the before/after alignment is reported",
+        "scripts/loop_report.py" in src,
+    )
+    check(
+        "a steered-batch scan that misses its ids is fatal",
+        "measures none of the" in src and "steered ids" in src,
+    )
+    check(
+        "N_SCAN defaults above the band-resolution floor",
+        'N_SCAN="${N_SCAN:-64}"' in src,
+        "below 35 a zero-pass cell is unresolved and the curriculum goes inert",
+    )
+    check(
+        "lowering N_SCAN below the floor warns",
+        "N_SCAN_MIN_FOR_BANDS" in src and "unresolved" in src,
     )
 
 

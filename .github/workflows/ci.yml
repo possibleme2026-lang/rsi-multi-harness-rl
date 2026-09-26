@@ -104,6 +104,14 @@ jobs:
           # trainer read a hardcoded task list so no generated task could reach
           # the gradient. Nothing raised; the plan just said "0 moves" forever.
           python tests/test_rsi_closed_loop.py
+          # ...and the loop's last hop, which stayed open after the above was
+          # fixed. The curriculum's steered batch was written to
+          # batch_steered.json and nothing read it back, so a run could move
+          # every task in the batch and the trainer would still read the
+          # pre-steer one. Also pins the zero-move diagnosis: "nothing needed
+          # moving" and "the scan was too small to place any cell" are different
+          # findings and used to look identical.
+          python tests/test_rsi_steered_batch.py
           python tests/smoke_env.py
           # Gate V1 applied to the harness axis: the reference solution must
           # reach 1.0 through each harness's *own* tools, held-out included.

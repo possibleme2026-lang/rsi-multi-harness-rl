@@ -234,8 +234,9 @@ def steer(
         Harder. Lengthen the payload, raise the escape density, add a step,
         and stop giving the content away in the prompt.
     ``out_of_reach``
-        Easier. Shorten the payload, remove escaping, drop to one step, and
-        ship the content in a file so it can be read rather than transcribed.
+        Easier. Shorten the payload, remove escaping, drop to one step, ship the
+        content in a file so it can be read rather than transcribed, and switch
+        the check to a plain string comparison.
     ``frontier``
         Hold. This is where training should happen; moving it would be
         undirected drift.
@@ -245,6 +246,15 @@ def steer(
     ``difficulty`` is accepted for logging and is not used in the decision, so
     that a caller cannot accidentally make the move depend on two different
     notions of difficulty.
+
+    ``verify_mode`` is moved only in the *easier* direction. ``python_exit``
+    asks the agent to write a script and is the largest single difficulty step
+    in ``TaskParams.difficulty`` (a full ``1.0`` of the five parts), so leaving
+    it out of an "make this easier" override would omit the biggest lever
+    available. It is not raised in the harder direction on purpose: that would
+    push the *reward* axis into a shape whose behaviour has not been measured,
+    and a difficulty move should not silently also be a change to what the
+    verifier is asked to do.
     """
     p = dict(params)
     length = int(p.get("payload_len", 4))
@@ -264,5 +274,6 @@ def steer(
             "escape_density": max(0.0, round(esc - 0.2, 3)),
             "steps": max(1, steps - 1),
             "read_source": True,
+            "verify_mode": "file_equals",
         }
     return {}

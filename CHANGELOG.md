@@ -166,6 +166,68 @@ before it.
      gradient never saw a generated task — a defect regardless of the plateau.
      `tests/test_rsi_closed_loop.py` pins all three properties: generation before
      the scan, the scan of that batch, and both consumers reading it.
+- **The loop was reachable, reached, and still inert — the last hop was missing.**
+  Fixing the ordering above made the *scan* measure the batch, so a generated
+  task could reach the gradient. A **steered** task still could not, because
+  `rsi_loop.py` wrote `execute_plan`'s output into `curriculum.json` and nothing
+  read it back:
+
+  ```
+  plan_regeneration -> moves -> execute_plan -> fresh tasks -> curriculum.json
+                                                                    ^ end of the line
+  ```
+
+  `batch.json` was never rewritten, so the training arms read the pre-steer
+  batch. A run could move every task in the batch, pass all four gates on every
+  replacement, and not change a single gradient. The artifact said so in its own
+  words — `measured_effect: "Whether it moved toward alpha needs a rescan of
+  these tasks"` — and that rescan was never run, because no script knew the
+  steered batch existed. This is the third instance of the same defect (mechanism
+  exists, tests pass, never reached) after the missing `steer` call site and the
+  trainer's hardcoded task list.
+
+  Fixed in three parts:
+  1. `curriculum.steered_batch(plan, batch)` returns the batch with moved tasks
+     replaced and the rest kept — length, order and kept ids all preserved, so a
+     task on the frontier keeps its id and therefore its measurement.
+     `execute_plan` is untouched: one function answers "what did the curriculum
+     produce", the other "what does the next round consume".
+  2. `rsi_loop.py --apply-curriculum` writes it to `rsi/batch_steered.json`,
+     unconditionally, including for a zero-move plan, so downstream has one path
+     rather than two.
+  3. `pipeline.sh` scans that file and hands it to `train.py`. The rescan is
+     skipped when nothing moved, and that decision is read from the artifact
+     (`curriculum.json → steered.moved`), not inferred from a log line.
+
+  `scripts/loop_report.py` reports the before/after alignment — the only number
+  the task axis produces that **could come out negative**, since every other
+  check is a pass/fail on well-formedness and a suite of pass/fail checks cannot
+  detect a curriculum that moves tasks the wrong way. It exits non-zero when the
+  delta is negative.
+
+  Also fixed alongside it: **a zero-move plan had three causes and only one was
+  visible.** `move_count: 0` now carries a top-level `move_diagnosis` —
+  `ids_mismatch` (scan the batch you intend to steer), `all_unresolved` (scan
+  more; this is about the measurement), or `all_frontier` (nothing to do, the
+  batch is on target). The middle case is the one that used to hide, and it is a
+  live risk: a band is assigned only when the whole Wilson interval falls inside
+  it, and the out-of-reach boundary is `0.1`, so a zero-pass cell needs **n ≥ 35**
+  before it can be placed at all (`hi = z²/(n+z²)`; `2/64 → 0.0955` places,
+  `3/64 → 0.1182` does not). `N_SCAN` therefore defaults to 64, not 8, and
+  `pipeline.sh` warns when it is set below the threshold. `APPLY_CURRICULUM` now
+  defaults to 1 — a curriculum that is planned but never applied cannot move a
+  gradient.
+
+  `tests/test_rsi_steered_batch.py` pins all of it, including the sign of the
+  report's delta under a swapped before/after. `test_rsi_closed_loop.py` gained
+  the pipeline-ordering assertions for the new hop.
+- **`band.steer` left the largest difficulty lever untouched.** The
+  "make this easier" rule moved `payload_len`, `escape_density`, `steps` and
+  `read_source` but not `verify_mode` — and `python_exit` carries a full `1.0` of
+  the five equal parts in `TaskParams.difficulty`, more than any other knob. The
+  `out_of_reach` override now sets `verify_mode: file_equals`. It is deliberately
+  *not* raised in the harder direction: that would change the reward axis rather
+  than only difficulty, and the behaviour of that shape has not been measured.
 - **The environment scan's before-picture was overwritten by its own re-scan.**
   Both wrote `outputs/rsi/env_scan.json`, and `probe.py` flushes after every cell,
   so the artifact that was the only evidence of the guidance defect was replaced
@@ -238,9 +300,10 @@ before it.
 
 ### Notes
 
-- `scripts/_probe_steps.py` is a throwaway diagnostic kept in-tree because the
-  `n_steps` ladder is the measurement that caught three of the bugs above; it is
-  not part of the pipeline.
+- The `n_steps` ladder was the measurement that caught three of the bugs above.
+  It lived in `scripts/_probe_steps.py`, a throwaway diagnostic that is no longer
+  in-tree — the reference was left behind when the file was removed, so this
+  paragraph used to point at a path that does not exist.
 - **Evaluation sweep** (`scripts/eval.py`) that runs the base model and both
   checkpoints in one process, against held-out tasks *and* the held-out harness,
   and reports the ablation with per-cell live counts.

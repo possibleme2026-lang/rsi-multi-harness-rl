@@ -461,6 +461,52 @@ def plan_regeneration(
     )
 
 
+def steered_batch(plan: CurriculumPlan, batch: list[dict]) -> list[dict]:
+    """The batch a *next* round should train on: moved tasks replaced, rest kept.
+
+    ``execute_plan`` answers "what did the curriculum produce"; this answers
+    "what does the next round consume", and the difference is the whole point.
+    The regenerated tasks used to be written to ``curriculum.json`` and stop
+    there — no script read them back, so the curriculum could only ever change
+    a file, never a gradient. That is the third instance of the same defect in
+    this repository: a mechanism that exists, passes its tests, and is never
+    reached by the thing it was built for.
+
+    Three properties, and each one is a bug that would otherwise be silent:
+
+    * **Length is preserved.** The result is the same size as the input, so a
+      downstream step that computes a row count from the batch keeps working.
+      Returning only the regenerated tasks would quietly shrink the training
+      set to the number of tasks the curriculum happened to move.
+    * **Only moved tasks change.** A task whose cell is on the frontier is
+      exactly the one training should see, so it is kept verbatim — including
+      its id, so its measurement stays attached to it. Dropping it because it
+      was not moved would delete the best rows in the batch.
+    * **Order is preserved.** The batch is a list and downstream code indexes
+      it; rebuilding it in plan order would make the two disagree.
+
+    ``tier`` is deliberately not rewritten. ``task_gen.generate`` never reads
+    it — it only enters through three nudges in ``sample_params`` — and the id
+    is a hash *of* the tier, so relabelling a task would leave its id and its
+    label contradicting each other. The band the task was moved for is recorded
+    on ``regenerated_band`` instead, which is a measurement rather than a
+    sampling coordinate.
+    """
+    moved = {m["task_id"]: m for m in plan.moves}
+    out: list[dict] = []
+    for t in batch:
+        m = moved.get(t["id"])
+        if m is None:
+            out.append(t)
+            continue
+        fresh = task_gen.reparameterise(t, **m["override"])
+        fresh["regenerated_from"] = t["id"]
+        fresh["regenerated_band"] = m["band"]
+        fresh["regenerated_direction"] = m["direction"]
+        out.append(fresh)
+    return out
+
+
 def execute_plan(plan: CurriculumPlan, tasks_by_id: dict[str, dict]) -> list[dict]:
     """Materialise a plan's moves into new tasks.
 

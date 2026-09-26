@@ -391,6 +391,22 @@ def run_curriculum_axis(
         "applied": False,
     }
 
+    # The batch-level alignment, before any move. `plan.as_dict()` already
+    # carries one, but it is computed over *resolved cells only*; this is the
+    # same quantity over every measured task, which is what a before/after
+    # comparison against the steered batch needs. The two are reported side by
+    # side rather than merged, because a reader who sees them disagree should be
+    # able to tell that the difference is the denominator.
+    measured = {
+        str(r["task_id"]): int(r["passes"]) / int(r["n"])
+        for r in cells
+        if int(r.get("n", 0)) > 0
+    }
+    result["alignment_before"] = round(
+        cu.batch_alignment(batch, measured, alpha=plan.alpha, beta=plan.beta), 6
+    )
+    result["alignment_after"] = "unmeasured — the steered batch has not been scanned"
+
     if not id_match:
         # Stated in the artifact, not only on stdout: a reader of
         # curriculum.json has to be able to tell "nothing needed moving" from
@@ -399,6 +415,30 @@ def run_curriculum_axis(
             f"the scan measures {len(scan_ids)} task ids, none of which are in the "
             f"batch of {len(tasks_by_id)}; no task can be steered"
         )
+
+    # Zero moves has three causes and they need three different responses. Only
+    # the first one used to be visible at the top level; the other two surfaced
+    # as `move_count: 0` with the reason buried in `held[].reason`, which reads
+    # exactly like "the batch is already on target" — the one interpretation
+    # that requires doing nothing. The other two require scanning more or
+    # scanning the right tasks, and a silent zero is how the previous instance
+    # of this defect survived.
+    if plan.move_count == 0:
+        if not id_match:
+            result["move_diagnosis"] = "ids_mismatch: scan the batch you intend to steer"
+        else:
+            held_reasons = {h.get("reason", "").split(":")[0] for h in plan.held}
+            if "unresolved" in held_reasons:
+                result["move_diagnosis"] = (
+                    "all_unresolved: every interval spans two bands — this is a "
+                    "statement about the scan, not the tasks; scan more (n>=35 to "
+                    "place a 0-pass cell, n=64 to place it comfortably)"
+                )
+            else:
+                result["move_diagnosis"] = (
+                    "all_frontier: every measured cell is in the band training "
+                    "should use — nothing to move, this batch is on target"
+                )
 
     if not apply:
         print("  (plan only — pass --apply-curriculum to regenerate and gate)")
@@ -438,6 +478,46 @@ def run_curriculum_axis(
         )
         print("  NOTE: gate-valid is not the same as better aligned. "
               "The alignment claim needs a rescan.")
+
+    # The steered batch is written for *every* apply, including a zero-move one.
+    #
+    # `fresh` above is the answer to "what did the curriculum produce"; it is
+    # ordered by the plan and contains only the moved tasks. What the next round
+    # needs is the whole batch with those tasks swapped in, which is a different
+    # object, and it is the one that has to exist on disk for the loop to close.
+    # Without this file the regenerated tasks stop at `curriculum.json` and the
+    # training run reads the pre-steer batch — the loop is reachable and never
+    # reached, which is the defect this function was rewritten to fix.
+    #
+    # Written unconditionally so downstream has one path rather than two: when
+    # nothing moved this is a byte-identical copy of `batch.json`, which is the
+    # correct input for the next stage either way.
+    steered = cu.steered_batch(plan, batch)
+    steered_path = OUT / "batch_steered.json"
+    steered_path.write_text(json.dumps(steered, indent=2), encoding="utf-8")
+    kept = sum(1 for t in steered if "regenerated_from" not in t)
+    # `applied` means "the curriculum was executed", not "something moved".
+    # A zero-move plan is still executed, and its correct output is the batch
+    # unchanged — so the flag is set here rather than inside the `if fresh`
+    # block above, where it would report `applied: false` for a run that did
+    # apply a (vacuous) plan and did write the file downstream reads.
+    result["applied"] = True
+    result["steered"] = {
+        "path": str(steered_path),
+        "total": len(steered),
+        "moved": len(steered) - kept,
+        "kept": kept,
+    }
+    result["provenance"] = [
+        {"from": t["regenerated_from"], "to": t["id"], "band": t["regenerated_band"],
+         "direction": t["regenerated_direction"]}
+        for t in steered
+        if "regenerated_from" in t
+    ]
+    print(f"  steered batch : {steered_path}  "
+          f"({len(steered)} tasks: {len(steered) - kept} moved, {kept} kept)")
+    print(f"      -> scan it, then train on it: "
+          f"probe.py --from-batch {steered_path}")
     print()
     return result
 

@@ -1,18 +1,19 @@
 # rsi-multi-harness-rl
 
-**面向 agentic RL 的递归自我改进：任务、奖励、harness 三者都由系统自己构建，再由会失败的闸门逐一把关。**
+**面向 agentic RL 的递归自我改进：任务、奖励、harness、环境四者都由系统自己构建，再由会失败的闸门逐一把关。**
 
 策略是在某个 *agent harness* 内部训练的。本仓库要问的是：当 harness 不再是一个训练之后才
-拍板的产品决策——当系统**自己生成任务、自己写奖励函数、自己演化 harness**，并且只保留那些
-增益超过实测噪声底线的改动时，会发生什么。
+拍板的产品决策——当系统**自己生成任务、自己写奖励函数、自己演化 harness、自己合成 agent 所作用的那个环境**，
+并且只保留那些增益超过实测噪声底线的改动时，会发生什么。
 
-这里有三个轴是自构建的，每一个都是被验证出来的，而不是被断言的：
+这里有四个轴是自构建的，每一个都是被验证出来的，而不是被断言的：
 
 | 轴 | 由谁构建 | 由谁把关 | 证据 |
 | --- | --- | --- | --- |
 | **任务** | `rsi/task_gen.py` | 闸门 V1–V4 | `outputs/rsi/validation.json` |
 | **奖励** | `rsi/verifier_gen.py` | V1 永不触发 / V2 总是触发 | 同一产物，按闸门分列 |
 | **harness** | `rsi/harness_evolve.py` | 噪声底线 + 工具面守卫 | `outputs/rsi/ledger.jsonl` |
+| **环境** | `rsi/envgen.py` | 可区分性 + Harbor 导出 | `outputs/rsi/env_validation.json` |
 
 [English](README.md)
 
@@ -219,6 +220,52 @@ harness 是有能力的。而 transcript（`scripts/diag.py --harness codex_styl
 "Plan first, then act" guidance 招来的——或者花在写在 markdown 围栏里的 JSON 调用上，而解析器不认。
 
 这个地板是策略的，不是 harness 的。把这个 gap 当作已测的泛化数字来报，等于在报 `0 == 0`。
+
+## 轴四 —— 环境是合成的，不是给定的
+
+前三个轴生成了任务、它的奖励、以及它运行所在的 harness。三者都仍然假定 agent *作用于*的那个东西
+是给定的——一个放着几个文件的文件系统，每个动作都是一条 shell 命令，其效果只在 stdout 里可见。
+那是最好训、也最不像真实部署场景的世界。
+
+`rsi/envgen.py` 补上了缺的那一半：一个**有状态环境**，带自己的工具面。生成出来的任务交付三件东西，
+而不是一段 prompt——
+
+* 一份 `tools.py`，agent 从自己的 shell 里调用它，于是环境是经真实 CLI 被操作的，而不是靠改文件；
+* 一份 `initial_state.json`，装着任务起始的那个世界；
+* 一个放在 `PATH` 上的 `envtool` shim，它按 rollout 重定位状态。
+
+奖励的形状也随之改变。字符串任务靠比对文件判分，是二值的。环境任务靠 `state_checkpoints` 判分——
+一组对最终世界状态的谓词——于是奖励是一个**分数**：四个 checkpoint 里对了三个，得 0.75 而不是 0。
+这跟前三个轴产出的任何训练信号都不是一回事，也正是这个轴独立存在、而不是并进轴一的理由。
+
+**被验证的部分。** 两道独立的检查，都在 CI 里，都不需要模型：
+
+| 检查 | 产物 | 结果 |
+| --- | --- | --- |
+| 每个合成环境都可区分 | `outputs/rsi/env_validation.json` | 30/30 `discriminable` |
+| 每个都能导出为可运行的 Harbor 包 | `outputs/rsi/harbor_local.json` | 30/30 ok |
+
+「可区分」才是关键属性：如果一个合成环境让参考解和「貌似合理的错误解」产生同样的状态，
+那它就是废的，因为 checkpoint 无法区分成败。这道闸门施加参考轨迹和一条被篡改的轨迹，要求两者得分不同。
+
+**被测量的部分。** `outputs/rsi/env_scan.json` 是对 12 个合成环境、4 个 harness、`n = 2` 的扫描，
+池化后：**0/96**，Wilson `[0, 0.0385]`，判定 `dead`。这是一个真实的地板，而不是测量不足——
+`0.0385` 低于 `0.05` 的信号底线，所以这次扫描排除了任何高于它的通过率。96 次 rollout 里有两次拿到
+部分分（0.4 和 0.2），这正是分数制奖励按设计工作的样子：策略不是被完全挡在门外，它是倒在了后面的 checkpoint 上。
+
+把轴一放在一起读，两个轴的失败方式不同，而这个差异就是结论。生成的*字符串*批次在 `n = 2` 时测得
+`0/16`，上界 `0.1936`——`under_measured`，与已发货套件最容易的那一档重叠，所以它支撑不了任何关于
+生成器的断言。而*环境*批次测得 `0/96`，可以。环境轴是「生成器的产出落在 0.5B 策略够不到的位置之下」
+这两条证据里更强的那一条。
+
+**已知限制 —— 课程目前还不能 steer 这个轴。** steer 规则移动的是**参数向量**，而
+`curriculum.plan_regeneration` 要求 task dict 上有 `params` 键。环境任务没有这个键：它们带的是
+`domain`、`difficulty`、`checkpoint_count`，因为它们是由 spec 构造出来的，不是从 `PARAM_SPACE` 抽样出来的。
+于是每个环境任务都掉进 `held`，理由是 "no parameters for this task id"；而真正存在的难度旋钮
+——`n_records`、`n_distractors`、`n_steps`——是整批传常量，而不是批内变化。
+`envgen.reparameterise_env` 就是为这件事写的，却没有任何调用点；它自己的 docstring 写着它是
+"the call site the curriculum needs once it is steering environments rather than strings."
+把它接上就是下一个轴的工作；在接上之前，环境轴是「被生成、被测量」的，但不是**被 steer** 的。
 
 ## 四道闸门，以及为什么是四道
 
@@ -444,6 +491,56 @@ shipped 套件展示出来的是一条值得沿着它做转向的难度曲线：
 套件从未触碰过的档位。这是否太难就是那个开放问题，而它只需要在 `n >= 32` 下对生成批次做一次 scan
 就能回答。在这份数据存在之前，诚实的说法是「生成器的标定尚未被测量」，而不是「它是错的」。
 
+**然后是第三次修正，因为第二次少走了一跳。** 上面那段说回路「*可到达*了，但并没有被*到达*」，
+并说修好顺序就闭合了它。这对**第一跳**成立，对**最后一跳**不成立。把 pipeline 的顺序排对，
+确实让 scan 测到了 batch，也让 `--require-signal` 会拒绝没测到 batch 的 scan——于是生成的任务
+可以到达梯度了。仍然到不了的，是**被 steer 过的**任务：
+
+```
+curriculum.plan_regeneration  ->  moves
+execute_plan                  ->  fresh tasks
+curriculum.json               <-  写在这里，没有任何人读
+```
+
+`rsi_loop.py` 把重生成的任务写进 `curriculum.json` 就结束了。`batch.json` 从未被改写，
+所以两条训练臂读的是 **steer 之前**的批次——而产物自己就是这么说的：
+
+> `measured_effect`: "none — the regenerated batch is gate-valid, which is a
+> solvability claim. Whether it moved toward alpha needs a rescan of these
+> tasks."
+
+那次 rescan 从未被执行，也没有任何脚本能执行它，因为没有任何东西知道 steer 后的批次存在。
+于是一次运行可以移动批次里的每一个任务、让每一个替换品都过四道闸门，却改变不了任何一条梯度。
+这是同一个缺陷的第三次出现——一个机制存在、测试通过，却从未被它所服务的东西走到——
+前两次是缺失的 `steer` 调用点，和训练器里硬编码的任务列表。
+
+修法分三部分，第三部分才让它成为一个回路：
+
+1. `curriculum.steered_batch(plan, batch)` 返回「被移动的任务已替换、其余原样保留」的批次，
+   长度、顺序、id 都守恒。
+2. `rsi_loop.py --apply-curriculum` 把它写到 `rsi/batch_steered.json`——**每次**施加都写，
+   包括零移动的那次，这样下游只有一条路径。
+3. `pipeline.sh` 扫描这个文件，并把**它**交给训练器，于是课程产出就是梯度所看到的东西。
+
+随后 `scripts/loop_report.py` 报出 steer 前后的对齐度。它是本仓库里任务轴产出的、**唯一可能为负**
+的数字——其他每一道检查都是关于「形状是否合法」的通过/失败，而一整套通过/失败检查无法发现
+一个把任务往错误方向移动的课程。当它真为负时，脚本以非零码退出。
+
+那个脚本给出的零也是被诊断过的，而不是裸报。`move_count: 0` 有三种成因，需要三种不同的应对，
+而过去只有第一种是可见的：
+
+| 诊断 | 含义 | 应对 |
+| --- | --- | --- |
+| `ids_mismatch` | scan 测的是另一个任务集 | 去扫你打算 steer 的那个批次 |
+| `all_unresolved` | 每个区间都横跨两档 | 加大扫描量——这是关于**测量**的结论，不是关于任务的 |
+| `all_frontier` | 每个单元格都在该训练的位置 | 无事可做；批次正中目标 |
+
+中间那一行就是过去藏起来的那行，而且它是现实风险而非假设：只有当整个 Wilson 区间落进同一档时
+才会给出 band，而 out-of-reach 的边界是 `0.1`，所以一个零通过的单元格需要 **n ≥ 35** 才可能被放置
+（`hi = z²/(n+z²)`；`2/64 → 0.0955` 可放置，`3/64 → 0.1182` 不行）。因此 `N_SCAN` 默认是 64 而不是 8，
+并且当它被设到阈值以下时 pipeline 会告警——因为扫描量太小的失败模式，是一个报着 "0 moves" 的课程，
+而那句话读起来恰恰像是「这个批次已经完美了」。
+
 ## 图表
 
 全部十三张都由 `./run.sh tools/plot.py` 从记录下来的产物重新生成，每一张都在 CI 里被校验：
@@ -526,6 +623,12 @@ gap = mean(reward | train harnesses) − mean(reward | held-out harness)
 
 同一个进程、同一个种子（42）、共享 harness 实例，5 个 harness × 8 个留出任务 × 4 次 rollout =
 **每条臂 160 次 rollout，合计 480 次**。每个单元格 `n = 4`。
+
+**这些数字早于当前版本的 `eval.py`，但结论方向不受影响。** `outputs/eval_ablation.json` 是在
+`e1f0b07` 之前产出的，当时脚本还按 gap 给各臂排名；那个排名后来被删掉了，因为 held-out 项是一条
+恒等式（见上文），现在同一份产物读出来是 `INCONCLUSIVE` 加一个单边下界。下面的 train 与 held-out
+数字没有变——那次修复没有移动任何数字，本仓库自己的 `CHANGELOG` 记录了这一点——所以由它们得出的
+结论依然成立。变的是脚本愿意从这些数字里做出什么**断言**。
 
 | 臂 | train harness reward | held-out reward | gap |
 | --- | --- | --- | --- |
@@ -625,21 +728,40 @@ RSI 循环本身在默认模式下不需要模型，所以生成器、四道闸�
 ./run.sh tools/check_readme_i18n.py
 ```
 
-闭合回路也有一条纯 CPU 路径，改动这四个阶段中任何一个之后，这是检查接线最省的办法：
+闭合回路也有一条纯 CPU 路径，改动这五个阶段中任何一个之后，这是检查接线最省的办法：
 
 ```bash
 # 1. 写出 batch（对 --seed 确定性）
 ./run.sh scripts/rsi_loop.py --batch-only --task-batch 12 --env-batch 4 --seed 11
-# 2. 测量它 —— 这一步才是闭合回路
+# 2. 测量它 —— 这一步让课程成为可能
 ./run.sh scripts/probe.py --from-batch outputs/rsi/batch.json \
-    --n 32 --out outputs/rsi/scan_batch.json
-# 3. 不加载模型，检查训练将要消费什么
+    --n 64 --out outputs/rsi/scan_batch.json
+# 3. steer 它：重生成被标记的任务，写出 steer 后的 batch
+./run.sh scripts/rsi_loop.py --task-batch 12 --seed 11 \
+    --scan outputs/rsi/scan_batch.json --apply-curriculum
+# 4. 测量 steer 后的 batch —— id 是新的，旧扫描覆盖不到它们
+./run.sh scripts/probe.py --from-batch outputs/rsi/batch_steered.json \
+    --n 64 --out outputs/rsi/scan_batch_steered.json
+# 5. 不加载模型，检查训练将要消费什么
 ./run.sh scripts/train.py --mode multi --steps 1 \
-    --batch outputs/rsi/batch.json --scan outputs/rsi/scan_batch.json \
+    --batch outputs/rsi/batch_steered.json --scan outputs/rsi/scan_batch_steered.json \
     --require-signal --dry-run
+# 以及那个唯一可能为负的数字
+./run.sh scripts/loop_report.py \
+    --before-batch outputs/rsi/batch.json --before-scan outputs/rsi/scan_batch.json \
+    --after-batch outputs/rsi/batch_steered.json \
+    --after-scan outputs/rsi/scan_batch_steered.json
 ```
 
-`pipeline.sh` 默认就跑这个顺序。`TRAIN_ON_BATCH=0` 可以退回「在随仓库发布的套件上训练」的旧行为。
+`--n 64` 不是偏好。只有当整个 Wilson 区间落进同一档时才会给出 band，而 out-of-reach 的边界是 `0.1`，
+所以一个零通过的单元格需要 **n ≥ 35** 才可能被放置。低于这个数，每个单元格都是 `unresolved`，
+计划会 hold 住每一个任务，第 3 步写出的 steer 后批次与输入完全相同——一次正确的空操作，
+看起来却像一个能工作的课程。第 5 步的 `--dry-run` 免费证明接线：它会打印
+`batch source : .../batch_steered.json`，然后在模型加载之前停下。
+
+`pipeline.sh` 默认就跑这个顺序；当第 3 步什么都没移动时，第 4 步的重扫会被跳过
+（那时 steer 后的文件是原批次的副本，已有的扫描恰好描述它）。`APPLY_CURRICULUM=0` 只规划不施加；
+`STEER_AND_RESCAN=0` 施加但在 steer 之前的批次上训练；`TRAIN_ON_BATCH=0` 退回在随仓库发布的套件上训练。
 
 `run.sh` 是受支持的入口，不是便利脚本。它会设置 `APPDATA`、HuggingFace 缓存目录并清掉
 `PYTHONPATH`，因为在 Windows 上这三者配错时给出的都是**误导性**报错而不是缺依赖报错——
@@ -662,13 +784,22 @@ SKIP_SCAN=1 bash pipeline.sh        # reuse an existing difficulty scan
 | 脚本 | 作用 |
 | --- | --- |
 | `scripts/probe.py` | 能力探测 + 难度扫描，写出 `scan_all.json` |
-| `scripts/rsi_loop.py` | 两条 RSI 轴：生成并验证任务、演化 harness |
+| `scripts/rsi_loop.py` | 四条 RSI 轴；`--batch-only` 写出批次，`--apply-curriculum` 写出 steer 后的批次 |
+| `scripts/loop_report.py` | steer 前后的对齐度——任务轴唯一一个可被证伪的数字 |
 | `scripts/train.py` | 消融的一条臂（`--mode single` / `--mode multi`） |
 | `scripts/eval.py` | baseline + 两条臂在同一进程内跑，打印消融表 |
 | `scripts/diag.py` | 单个 (harness, task) 的完整未截断轨迹 |
 | `scripts/errs_report.py` | 归类扫描中的工具错误：harness 缺陷还是模型行为 |
 | `scripts/guard_tool_surface.py` | 宣称的工具必须等于实现的工具 |
 | `scripts/merge_scan.py` | 把局部重扫合并进旧 dump，带不变量检查 |
+| `scripts/harness_solvability.py` | 让参考解穿过每个 harness **自己的**工具验证 Gate V1，而不是走 oracle |
+| `scripts/env_batch_make.py` | 合成一个环境批次，使它能由一条命令复现 |
+| `scripts/env_harness_smoke.py` | 用脚本化策略把环境任务驱动过真实 harness |
+| `scripts/env_reward_ceiling.py` | 不用模型证明奖励路径可达 1.0 |
+| `scripts/env_scan_report.py` | 把每次环境 rollout 漏斗到它停下的那个阶段 |
+| `scripts/env_spread_significance.py` | 跨 harness 的差异是信号，还是两个幸运样本？ |
+| `scripts/guidance_shape_check.py` | guidance 是否改变了它诱发出来的工具调用的**形状**？ |
+| `scripts/harbor_local_run.py` | 不依赖 Docker 运行导出的 Harbor 包 |
 
 ## 目录结构
 
